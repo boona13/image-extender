@@ -1348,3 +1348,1612 @@ export function getImageDimensions(dataUrl: string): Promise<{ width: number; he
   })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Parallax mode helpers — split a long horizontal background into game-sized
+// tiles for engine import (Unity, Godot, Phaser, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ParallaxTile {
+  dataUrl: string
+  /** 1-indexed position in the strip, useful for filenames. */
+  index: number
+  width: number
+  height: number
+  /** X offset in the source image where this tile starts. */
+  sourceX: number
+}
+
+/**
+ * Slice a wide image into vertical tiles of `tileWidth`, full image height.
+ * The last tile is the natural remaining width if the image isn't an exact
+ * multiple — game engines handle non-uniform tail tiles fine and padding can
+ * introduce false edges.
+ */
+export function splitIntoTiles(
+  imageDataUrl: string,
+  tileWidth: number
+): Promise<ParallaxTile[]> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const tiles: ParallaxTile[] = []
+      const tileHeight = img.height
+      const numTiles = Math.max(1, Math.ceil(img.width / tileWidth))
+
+      for (let i = 0; i < numTiles; i++) {
+        const sourceX = i * tileWidth
+        const w = Math.min(tileWidth, img.width - sourceX)
+        if (w <= 0) break
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = tileHeight
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          reject(new Error('Failed to get canvas context'))
+          return
+        }
+        ctx.drawImage(img, sourceX, 0, w, tileHeight, 0, 0, w, tileHeight)
+        tiles.push({
+          dataUrl: canvas.toDataURL('image/png'),
+          index: i + 1,
+          width: w,
+          height: tileHeight,
+          sourceX,
+        })
+      }
+      resolve(tiles)
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = imageDataUrl
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chroma keying — turns a flat key-color background (default magenta) into
+// real transparency. Used in parallax mode so the foreground / mid / far
+// layers can stack over the sky layer with proper alpha. Includes a soft-
+// edge falloff and despill so element borders don't show a magenta fringe.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ChromaKeyOptions {
+  /** Key color RGB. Default is pure magenta (255,0,255). */
+  keyR?: number
+  keyG?: number
+  keyB?: number
+  /**
+   * Magenta-cast value at or above which a pixel becomes fully transparent.
+   * Cast = max(0, min(r, b) - g). Range 0..255. Default 80 — comfortably
+   * above the cast that natural warm/cool tones produce while still catching
+   * blended-edge pixels.
+   */
+  castThreshold?: number
+  /**
+   * Width of the soft alpha falloff just below `castThreshold`. Pixels with
+   * cast in `[castThreshold - castSoftness, castThreshold]` get partial
+   * alpha so anti-aliased element borders feather cleanly. Default 30.
+   */
+  castSoftness?: number
+  /**
+   * How aggressively to neutralize magenta cast on every pixel that has
+   * any. 0 = off (leaves a pink halo); 1 = fully subtract the cast from
+   * R and B. Default 1.0 — natural images contain no real magenta, so any
+   * cast is a blend artefact and should be removed.
+   */
+  despill?: number
+  /**
+   * Fraction of the despilled cast to add back into the green channel so
+   * a desaturated edge pixel doesn't go dead grey. Default 0.5.
+   */
+  despillGreenBoost?: number
+}
+
+/**
+ * Returns a new PNG data URL with the key color replaced by transparency.
+ *
+ * Default tuning is for pure magenta (#FF00FF) backgrounds. Instead of a
+ * naive Euclidean RGB distance to the key — which treats saturated reds and
+ * blues as "kinda magenta" — we use the standard chroma-key MAGENTA-CAST
+ * metric: `cast = max(0, min(r, b) - g)`. This is 0 for any natural color
+ * that lacks a magenta tint (greens, neutrals, deep reds, deep blues) and
+ * approaches 255 for pure magenta. It cleanly separates "pixel is partially
+ * blended with the magenta background" from "pixel happens to contain warm
+ * red/blue tones that aren't magenta at all".
+ *
+ * The result:
+ *   • Cast ≥ castThreshold      → fully transparent
+ *   • castSoftness wide soft zone below that → smooth alpha falloff
+ *   • Cast > 0                  → ALWAYS despilled (subtracts the cast from
+ *                                 R and B, optionally boosts G to keep
+ *                                 luminance), regardless of resulting alpha.
+ *     The previous version only despilled semi-transparent pixels, which
+ *     is exactly why fully-opaque-but-still-pink edge pixels showed up as
+ *     a magenta halo around mountains / leaves / rocks. Despilling all
+ *     pixels is safe because pure magenta never appears in natural art —
+ *     any cast in the image is a blend artefact.
+ */
+export function chromaKeyToAlpha(
+  imageDataUrl: string,
+  opts: ChromaKeyOptions = {}
+): Promise<string> {
+  const {
+    keyR = 255,
+    keyG = 0,
+    keyB = 255,
+    castThreshold = 80,
+    castSoftness = 30,
+    despill = 1,
+    despillGreenBoost = 0.5,
+  } = opts
+
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const canvas = document.createElement('canvas')
+      canvas.width = img.width
+      canvas.height = img.height
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
+      ctx.drawImage(img, 0, 0)
+      const imageData = ctx.getImageData(0, 0, img.width, img.height)
+      const data = imageData.data
+
+      // Allow non-magenta keys to fall back to the original Euclidean
+      // distance algorithm so callers who pass a custom (non-magenta)
+      // key color still get a working chroma key.
+      const isMagentaKey = keyR === 255 && keyG === 0 && keyB === 255
+
+      for (let i = 0; i < data.length; i += 4) {
+        let r = data[i]
+        let g = data[i + 1]
+        let b = data[i + 2]
+
+        if (isMagentaKey) {
+          const cast = Math.max(0, Math.min(r, b) - g)
+
+          let alpha: number
+          if (cast >= castThreshold) {
+            alpha = 0
+          } else if (cast <= 0) {
+            alpha = 255
+          } else {
+            // Smooth ramp inside [max(0, castThreshold-castSoftness), castThreshold]:
+            // pixels with mild cast keep most of their alpha but get partial
+            // transparency so anti-aliased element borders feather cleanly
+            // into the layer below.
+            const softFloor = Math.max(0, castThreshold - castSoftness)
+            if (cast <= softFloor) {
+              alpha = 255
+            } else {
+              const t = (cast - softFloor) / (castThreshold - softFloor)
+              alpha = Math.round(255 * (1 - t))
+            }
+          }
+          data[i + 3] = alpha
+
+          // Despill every pixel with any magenta cast — including the
+          // fully-opaque ones the previous algorithm skipped, which were
+          // the actual source of pink halos around real elements.
+          if (cast > 0 && despill > 0) {
+            const reduction = cast * despill
+            r = Math.max(0, Math.round(r - reduction))
+            b = Math.max(0, Math.round(b - reduction))
+            if (despillGreenBoost > 0) {
+              g = Math.min(255, Math.round(g + reduction * despillGreenBoost))
+            }
+            data[i] = r
+            data[i + 1] = g
+            data[i + 2] = b
+          }
+        } else {
+          // Non-magenta key: legacy Euclidean distance fallback.
+          const dr = r - keyR
+          const dg = g - keyG
+          const db = b - keyB
+          const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+          const fallbackThreshold = 90
+          const fallbackSoftness = 60
+          let alpha: number
+          if (dist <= fallbackThreshold) {
+            alpha = 0
+          } else if (dist >= fallbackThreshold + fallbackSoftness) {
+            alpha = 255
+          } else {
+            alpha = Math.round(((dist - fallbackThreshold) / fallbackSoftness) * 255)
+          }
+          data[i + 3] = alpha
+        }
+      }
+      ctx.putImageData(imageData, 0, 0)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = imageDataUrl
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Horizontal seam harmonization — kills the visible "panel banding" you get
+// after chaining many AI outpaints. Each AI call introduces a tiny color /
+// brightness shift; with N extends those shifts accumulate into clearly
+// distinct vertical bands across a long parallax background, even though
+// every individual seam was Poisson-blended at the moment of stitching.
+//
+// The fix: compute the per-column mean color across the image height, run
+// a wide Gaussian over that 1-D profile to get a "what each column SHOULD
+// look like if there were no panel drift" reference, and shift every pixel
+// in column `x` by `(smoothed_mean(x) - actual_mean(x)) * strength`.
+//
+// This removes low-frequency horizontal DC drift while preserving every
+// pixel's relative deviation from its column's mean, so clouds, shapes,
+// and texture are untouched — only the underlying "tint trend" changes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface HarmonizeOptions {
+  /**
+   * Standard deviation of the smoothing Gaussian, in pixels. Larger values
+   * smooth across more panels and give a more uniform result; smaller
+   * values preserve more legitimate horizontal variation. Defaults to
+   * `imageWidth / 8`, clamped to [120, 900].
+   */
+  sigmaPx?: number
+  /**
+   * How aggressively to apply the correction. 1.0 = match smoothed profile
+   * exactly; 0.5 = halfway between original and target. Default 0.85 —
+   * strong enough to kill panels, soft enough to keep natural variation.
+   */
+  strength?: number
+  /**
+   * Skip pixels that are close to this color in mean computation AND
+   * correction. Used for parallax keyed layers (raw magenta-bg images) so
+   * the magenta key stays uniform and only the visible elements get
+   * harmonized.
+   */
+  ignoreKeyColor?: { r: number; g: number; b: number; threshold?: number }
+  /**
+   * Skip pixels with alpha below this value. Used for already-keyed images
+   * (with real alpha) so transparent regions don't pollute column means
+   * and don't get correction applied.
+   */
+  minAlpha?: number
+}
+
+function gaussianKernel1D(sigma: number): Float32Array {
+  const radius = Math.max(1, Math.ceil(sigma * 3))
+  const k = new Float32Array(radius * 2 + 1)
+  let sum = 0
+  for (let i = -radius; i <= radius; i++) {
+    const v = Math.exp(-(i * i) / (2 * sigma * sigma))
+    k[i + radius] = v
+    sum += v
+  }
+  for (let i = 0; i < k.length; i++) k[i] /= sum
+  return k
+}
+
+function smooth1D(arr: Float32Array, sigma: number): Float32Array {
+  const k = gaussianKernel1D(sigma)
+  const radius = (k.length - 1) / 2
+  const N = arr.length
+  const out = new Float32Array(N)
+  for (let i = 0; i < N; i++) {
+    let acc = 0
+    let w = 0
+    for (let j = -radius; j <= radius; j++) {
+      const x = i + j
+      if (x < 0 || x >= N) continue
+      const kw = k[j + radius]
+      acc += arr[x] * kw
+      w += kw
+    }
+    out[i] = w > 0 ? acc / w : arr[i]
+  }
+  return out
+}
+
+/**
+ * Equalize horizontal color drift across an image. See block comment above
+ * for the algorithm. Returns a new PNG data URL; the input is unchanged.
+ */
+export function harmonizeHorizontalSeams(
+  imageDataUrl: string,
+  options: HarmonizeOptions = {}
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const W = img.width
+      const H = img.height
+      const canvas = document.createElement('canvas')
+      canvas.width = W
+      canvas.height = H
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
+      ctx.drawImage(img, 0, 0)
+      const imageData = ctx.getImageData(0, 0, W, H)
+      const data = imageData.data
+
+      const strength = options.strength ?? 0.85
+      const sigmaPx =
+        options.sigmaPx ?? Math.max(120, Math.min(900, Math.round(W / 8)))
+      const minAlpha = options.minAlpha ?? 0
+      const key = options.ignoreKeyColor
+      const keyThreshold = key?.threshold ?? 80
+      const keyThresholdSq = keyThreshold * keyThreshold
+
+      // ── Pass 1: per-column means over participating pixels ─────────────
+      const sumR = new Float32Array(W)
+      const sumG = new Float32Array(W)
+      const sumB = new Float32Array(W)
+      const counts = new Float32Array(W)
+
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const idx = (y * W + x) * 4
+          const a = data[idx + 3]
+          if (a < minAlpha) continue
+          const r = data[idx]
+          const g = data[idx + 1]
+          const b = data[idx + 2]
+          if (key) {
+            const dr = r - key.r
+            const dg = g - key.g
+            const db = b - key.b
+            if (dr * dr + dg * dg + db * db < keyThresholdSq) continue
+          }
+          sumR[x] += r
+          sumG[x] += g
+          sumB[x] += b
+          counts[x] += 1
+        }
+      }
+
+      const meanR = new Float32Array(W)
+      const meanG = new Float32Array(W)
+      const meanB = new Float32Array(W)
+      // For columns with zero participating pixels (e.g. fully magenta
+      // column on a keyed layer), fall back to the global mean of all
+      // participating pixels so smoothing has a sensible value to use.
+      let globalR = 0
+      let globalG = 0
+      let globalB = 0
+      let globalCount = 0
+      for (let x = 0; x < W; x++) {
+        if (counts[x] > 0) {
+          meanR[x] = sumR[x] / counts[x]
+          meanG[x] = sumG[x] / counts[x]
+          meanB[x] = sumB[x] / counts[x]
+          globalR += sumR[x]
+          globalG += sumG[x]
+          globalB += sumB[x]
+          globalCount += counts[x]
+        }
+      }
+      if (globalCount === 0) {
+        // No participating pixels at all — nothing to harmonize.
+        resolve(imageDataUrl)
+        return
+      }
+      const gR = globalR / globalCount
+      const gG = globalG / globalCount
+      const gB = globalB / globalCount
+      for (let x = 0; x < W; x++) {
+        if (counts[x] === 0) {
+          meanR[x] = gR
+          meanG[x] = gG
+          meanB[x] = gB
+        }
+      }
+
+      // ── Pass 2: smooth the per-column means across X ────────────────────
+      const smoothR = smooth1D(meanR, sigmaPx)
+      const smoothG = smooth1D(meanG, sigmaPx)
+      const smoothB = smooth1D(meanB, sigmaPx)
+
+      // ── Pass 3: shift every participating pixel toward the smoothed ────
+      //          column mean. Skip key-color and low-alpha pixels so the
+      //          magenta background and transparent regions stay clean.
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const idx = (y * W + x) * 4
+          const a = data[idx + 3]
+          if (a < minAlpha) continue
+          const r = data[idx]
+          const g = data[idx + 1]
+          const b = data[idx + 2]
+          if (key) {
+            const dr = r - key.r
+            const dg = g - key.g
+            const db = b - key.b
+            if (dr * dr + dg * dg + db * db < keyThresholdSq) continue
+          }
+          const shiftR = (smoothR[x] - meanR[x]) * strength
+          const shiftG = (smoothG[x] - meanG[x]) * strength
+          const shiftB = (smoothB[x] - meanB[x]) * strength
+          const nr = r + shiftR
+          const ng = g + shiftG
+          const nb = b + shiftB
+          data[idx] = nr < 0 ? 0 : nr > 255 ? 255 : nr
+          data[idx + 1] = ng < 0 ? 0 : ng > 255 ? 255 : ng
+          data[idx + 2] = nb < 0 ? 0 : nb > 255 ? 255 : nb
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = imageDataUrl
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Make horizontally tileable — the AI generates a beautiful continuous
+// background, but the LEFT edge and the RIGHT edge of the final image were
+// never asked to match each other. So when a game engine tiles this texture
+// horizontally with `repeat-x`, the loop point (right edge of one tile
+// meeting left edge of the next) shows a hard discontinuity that ruins the
+// illusion of an infinite parallax.
+//
+// The professional fix has THREE stages — a single seam patch isn't enough
+// for non-pixel-art content. From Julieanne Kost's classic Photoshop tile
+// recipe and modern parallax pipelines:
+//
+//   0. Equalize horizontal tonality FIRST. If the source has directional
+//      lighting (sunset dark→bright, sunrise bright→dark, vignettes, etc.)
+//      then even a perfect seam join will tile as a clearly periodic
+//      dark/light pattern — every loop point becomes visible as a band
+//      because the eye picks up the brightness rhythm. Flattening the
+//      DC drift across the image kills that rhythm so the tile looks
+//      like one continuous flow when repeated.
+//
+//   1. Offset the image by W/2 (split into halves and swap them). The
+//      original wrap-around discontinuity is now in the MIDDLE of the
+//      offset image; the new "edges" of the offset image come from pixels
+//      that were ADJACENT in the original, so they naturally match.
+//
+//   2. Heal the now-middle seam by blending each pixel in a narrow strip
+//      around the seam with its mirror across the seam line. The blend
+//      weight peaks at 50/50 right at the seam (so seam pixel values
+//      become the average of left and right — invisible) and falls to
+//      zero at the strip edges. This mixes both COLORS (handles any
+//      remaining local discontinuity) and SHAPE/TEXTURE content (so
+//      painterly cloud shapes ghost-fade into each other instead of
+//      butting hard).
+//
+//   3. Offset back so the user's "x=0" content stays in place. The healed
+//      strip ends up split across the loop point — exactly where it
+//      needs to be to make tiling seamless.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MakeTileableOptions {
+  /**
+   * Width in pixels of the seam-distribution strip. Wider = smoother
+   * gradient near the loop, but more original content gets shifted.
+   * Defaults to ~10% of the image width, clamped to [32, 800].
+   */
+  blendWidthPx?: number
+  /**
+   * Skip pixels close to this color when measuring/applying the seam
+   * correction. Used for parallax keyed layers (raw magenta-bg images)
+   * so the magenta key isn't tinted. Rows where either seam pixel is
+   * the key color are skipped entirely.
+   */
+  ignoreKeyColor?: { r: number; g: number; b: number; threshold?: number }
+  /**
+   * Treat pixels with alpha below this value as "key" — so transparent
+   * regions in already-keyed images don't get correction applied.
+   */
+  minAlpha?: number
+  /**
+   * How aggressively to flatten the horizontal tonal drift before the
+   * seam fix (Stage 0). 0 = preserve original lighting (visible bands
+   * if the source has a strong dark→bright gradient), 1 = fully flat
+   * tonality (best tiling, but loses any directional sun/sunset look).
+   * Default 0.85 — strong enough to kill periodic banding for painterly
+   * skies, soft enough to keep some natural variation.
+   */
+  equalizeStrength?: number
+}
+
+/**
+ * Returns a new PNG data URL that loops seamlessly when tiled horizontally.
+ * The original is unchanged. Sky / opaque images and keyed (magenta-bg)
+ * images both work — pass `ignoreKeyColor` for the latter.
+ */
+export async function makeHorizontallyTileable(
+  imageDataUrl: string,
+  options: MakeTileableOptions = {}
+): Promise<string> {
+  // ── Stage 0: equalize horizontal tonal drift ────────────────────────────
+  // This is what makes the difference between "works for pixel art only"
+  // and "works for everything". A painterly sky with directional lighting
+  // tiles as visible periodic bands UNLESS the dark-to-bright gradient is
+  // flattened across the whole image first. Pixel art usually has flat
+  // tonality already, which is why the previous version looked fine on
+  // pixel art and showed obvious banding on photo/painterly content.
+  const equalizeStrength = options.equalizeStrength ?? 0.85
+  const equalized =
+    equalizeStrength > 0
+      ? await harmonizeHorizontalSeams(imageDataUrl, {
+          strength: equalizeStrength,
+          // Tighter sigma than the default panel-banding fix because here
+          // we want to flatten the WHOLE image's left-right drift, not
+          // just smooth multi-panel artefacts. ~W/4 gives a smoothing
+          // window that spans roughly half the image — enough to kill the
+          // global directional gradient.
+          sigmaPx: undefined,
+          ignoreKeyColor: options.ignoreKeyColor,
+          minAlpha: options.minAlpha,
+        })
+      : imageDataUrl
+
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const W = img.width
+      const H = img.height
+      if (W < 8 || H < 1) {
+        resolve(equalized)
+        return
+      }
+      const halfW = Math.floor(W / 2)
+      // Default blend strip = 10% of width. Wider than a pure DC-shift
+      // approach because the mirror-fade needs room to ramp the per-pixel
+      // mirror weight smoothly from 0.5 (at seam) down to 0 (at edges) —
+      // a wider ramp means painterly clouds get more frames to ghost-
+      // fade into their counterpart, which reads as a soft transition
+      // rather than a "double exposure".
+      const K = Math.max(
+        32,
+        Math.min(800, options.blendWidthPx ?? Math.round(W * 0.1))
+      )
+      const seamX = W - halfW
+
+      // ── Step 1: roll the image by halfW into a working canvas ───────────
+      const canvas = document.createElement('canvas')
+      canvas.width = W
+      canvas.height = H
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
+      // Right half of the original → left of rolled.
+      ctx.drawImage(img, halfW, 0, W - halfW, H, 0, 0, W - halfW, H)
+      // Left half of the original → right of rolled.
+      ctx.drawImage(img, 0, 0, halfW, H, W - halfW, 0, halfW, H)
+
+      // ── Step 2: mirror-fade across the middle seam ─────────────────────
+      // For each pixel in the strip [seamX - K, seamX + K], blend its
+      // value with the value of its mirror across the seam line. Blend
+      // weight peaks at 0.5 right at the seam (making seam pixels equal
+      // to the seam average → invisible) and falls smoothly to 0 at the
+      // strip boundaries (so far-from-seam pixels are unchanged).
+      const imageData = ctx.getImageData(0, 0, W, H)
+      const data = imageData.data
+      // Snapshot before any writes so reads always see the un-modified
+      // rolled values regardless of iteration order.
+      const snapshot = new Uint8ClampedArray(data)
+
+      const smoothstep = (t: number): number => {
+        const c = t < 0 ? 0 : t > 1 ? 1 : t
+        return c * c * (3 - 2 * c)
+      }
+
+      const key = options.ignoreKeyColor
+      const keyT = key?.threshold ?? 80
+      const keyTSq = keyT * keyT
+      const minAlpha = options.minAlpha ?? 0
+
+      const isKeyPixel = (r: number, g: number, b: number, a: number) => {
+        if (a < minAlpha) return true
+        if (!key) return false
+        const dr = r - key.r
+        const dg = g - key.g
+        const db = b - key.b
+        return dr * dr + dg * dg + db * db < keyTSq
+      }
+
+      const stripStart = Math.max(0, seamX - K)
+      const stripEnd = Math.min(W, seamX + K)
+
+      for (let y = 0; y < H; y++) {
+        for (let x = stripStart; x < stripEnd; x++) {
+          const idx = (y * W + x) * 4
+          const sR = snapshot[idx]
+          const sG = snapshot[idx + 1]
+          const sB = snapshot[idx + 2]
+          const sA = snapshot[idx + 3]
+          if (isKeyPixel(sR, sG, sB, sA)) continue
+
+          const mirrorX = 2 * seamX - 1 - x
+          if (mirrorX < 0 || mirrorX >= W) continue
+
+          const mIdx = (y * W + mirrorX) * 4
+          const mR = snapshot[mIdx]
+          const mG = snapshot[mIdx + 1]
+          const mB = snapshot[mIdx + 2]
+          const mA = snapshot[mIdx + 3]
+          if (isKeyPixel(mR, mG, mB, mA)) continue
+
+          // Distance from seam, normalised to [0, 1]. Using the sub-pixel
+          // offset 0.5 keeps the math symmetric across seamX so the two
+          // pixels straddling the seam (seamX-1 and seamX) both land at
+          // the same blend weight 0.5.
+          const dist = Math.min(1, Math.abs(x - seamX + 0.5) / K)
+          // Mirror weight peaks at 0.5 (at seam) and tapers to 0 (at
+          // strip boundaries). Smoothstep on (1 - dist) gives a smooth
+          // bell that's flat at both ends — no visible kink at the
+          // strip edges.
+          const alphaMirror = 0.5 * smoothstep(1 - dist)
+          const alphaOrig = 1 - alphaMirror
+
+          const r = alphaOrig * sR + alphaMirror * mR
+          const g = alphaOrig * sG + alphaMirror * mG
+          const b = alphaOrig * sB + alphaMirror * mB
+          data[idx] = r < 0 ? 0 : r > 255 ? 255 : r
+          data[idx + 1] = g < 0 ? 0 : g > 255 ? 255 : g
+          data[idx + 2] = b < 0 ? 0 : b > 255 ? 255 : b
+        }
+      }
+      ctx.putImageData(imageData, 0, 0)
+
+      // ── Step 3: roll back so the user's original "start" stays at x=0.
+      // Rolling by halfW twice = identity on indexing; the corrections we
+      // applied at the rolled middle land split across positions [W-K, W-1]
+      // and [0, K-1] in the final image — exactly the loop point.
+      const finalCanvas = document.createElement('canvas')
+      finalCanvas.width = W
+      finalCanvas.height = H
+      const finalCtx = finalCanvas.getContext('2d')
+      if (!finalCtx) {
+        reject(new Error('Failed to get final canvas context'))
+        return
+      }
+      finalCtx.drawImage(canvas, halfW, 0, W - halfW, H, 0, 0, W - halfW, H)
+      finalCtx.drawImage(canvas, 0, 0, halfW, H, W - halfW, 0, halfW, H)
+
+      resolve(finalCanvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = equalized
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Make vertically tileable — same algorithm as `makeHorizontallyTileable`
+// but applied along Y. Implementation rotates the source 90° clockwise,
+// runs the horizontal pass, then rotates back. This reuses every helper
+// (snapshot, smoothstep, mirror-fade, equalize) without duplication.
+//
+// Used by edge tiles whose only loop axis is vertical (left edge / right
+// edge in a platformer auto-tile).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function makeVerticallyTileable(
+  imageDataUrl: string,
+  options: MakeTileableOptions = {}
+): Promise<string> {
+  const rotated = await rotate90(imageDataUrl, 'cw')
+  const tiled = await makeHorizontallyTileable(rotated, options)
+  return rotate90(tiled, 'ccw')
+}
+
+/** Rotate a PNG data URL by 90 degrees in either direction. */
+async function rotate90(
+  imageDataUrl: string,
+  direction: 'cw' | 'ccw'
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const W = img.width
+      const H = img.height
+      const canvas = document.createElement('canvas')
+      canvas.width = H
+      canvas.height = W
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get rotation canvas context'))
+        return
+      }
+      // Translate to the new center, rotate, then draw centered on origin.
+      ctx.translate(canvas.width / 2, canvas.height / 2)
+      ctx.rotate(direction === 'cw' ? Math.PI / 2 : -Math.PI / 2)
+      ctx.drawImage(img, -W / 2, -H / 2)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image for rotation'))
+    img.src = imageDataUrl
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice an image into a uniform grid of cells. Used by the tile-set
+// sprite-sheet flow: one AI call returns the full 4×4 sheet, then this
+// utility cuts it into row-major cells. The source is rescaled to the
+// expected sheet dimensions BEFORE slicing so the cuts always land on
+// clean fractional boundaries even if the AI returned a slightly-off
+// resolution (e.g. 2056×2048 instead of 2048²).
+//
+// Returns row-major cells: `result[row * cols + col]`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SliceImageGridOptions {
+  cols: number
+  rows: number
+  /** Final cell size in pixels. Each output PNG is exactly this size. */
+  cellSize: number
+}
+
+export async function sliceImageGrid(
+  imageDataUrl: string,
+  options: SliceImageGridOptions
+): Promise<string[]> {
+  const { cols, rows, cellSize } = options
+  const sheetW = cols * cellSize
+  const sheetH = rows * cellSize
+
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      // Normalize to the expected sheet size first so slicing always lands
+      // on clean cell boundaries, even when the model returns a slightly
+      // different resolution.
+      const sheetCanvas = document.createElement('canvas')
+      sheetCanvas.width = sheetW
+      sheetCanvas.height = sheetH
+      const sheetCtx = sheetCanvas.getContext('2d')
+      if (!sheetCtx) {
+        reject(new Error('Failed to get sheet canvas context'))
+        return
+      }
+      sheetCtx.imageSmoothingEnabled = true
+      sheetCtx.imageSmoothingQuality = 'high'
+      sheetCtx.drawImage(img, 0, 0, sheetW, sheetH)
+
+      const cells: string[] = []
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const cellCanvas = document.createElement('canvas')
+          cellCanvas.width = cellSize
+          cellCanvas.height = cellSize
+          const cellCtx = cellCanvas.getContext('2d')
+          if (!cellCtx) {
+            reject(new Error('Failed to get cell canvas context'))
+            return
+          }
+          cellCtx.drawImage(
+            sheetCanvas,
+            c * cellSize,
+            r * cellSize,
+            cellSize,
+            cellSize,
+            0,
+            0,
+            cellSize,
+            cellSize
+          )
+          cells.push(cellCanvas.toDataURL('image/png'))
+        }
+      }
+      resolve(cells)
+    }
+    img.onerror = () => reject(new Error('Failed to load image for slicing'))
+    img.src = imageDataUrl
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Make 2D tileable — combines the horizontal pass (`makeHorizontallyTileable`)
+// with a vertical pass that fixes the top↔bottom seam the same way: roll the
+// image by H/2, mirror-fade the now-middle horizontal seam between halves,
+// then roll back. The end result tiles seamlessly in BOTH X and Y for engine
+// tile-map use (stones, grass, brick, dirt, etc.).
+//
+// Skips the equalize-tonality stage 0 by default for vertical: material
+// textures usually have NO directional vertical gradient (no sky-to-ground)
+// so flattening would only erase legitimate variation. The horizontal pass
+// still runs equalize because horizontal directional drift is common (and
+// the source already wasn't tile-friendly because of it).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MakeTileable2DOptions extends MakeTileableOptions {
+  /**
+   * Vertical seam-distribution strip height in pixels. Defaults to ~10% of
+   * the image height, clamped to [32, 800].
+   */
+  verticalBlendHeightPx?: number
+}
+
+/**
+ * Returns a new PNG data URL that loops seamlessly when tiled in BOTH X and Y.
+ * The original is unchanged. Designed for opaque material textures; works on
+ * keyed images too if `ignoreKeyColor` is passed.
+ */
+export async function makeTileable2D(
+  imageDataUrl: string,
+  options: MakeTileable2DOptions = {}
+): Promise<string> {
+  // ── Pass 1: horizontal tileability (with default tonal equalize) ───────
+  const horizontallyTileable = await makeHorizontallyTileable(
+    imageDataUrl,
+    options
+  )
+
+  // ── Pass 2: vertical tileability ────────────────────────────────────────
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      const W = img.width
+      const H = img.height
+      if (H < 8 || W < 1) {
+        resolve(horizontallyTileable)
+        return
+      }
+
+      const halfH = Math.floor(H / 2)
+      const K = Math.max(
+        32,
+        Math.min(800, options.verticalBlendHeightPx ?? Math.round(H * 0.1))
+      )
+      const seamY = H - halfH
+
+      // Step 1: roll the image by halfH into a working canvas.
+      const canvas = document.createElement('canvas')
+      canvas.width = W
+      canvas.height = H
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
+      // Bottom half of the source → top of rolled.
+      ctx.drawImage(img, 0, halfH, W, H - halfH, 0, 0, W, H - halfH)
+      // Top half of the source → bottom of rolled.
+      ctx.drawImage(img, 0, 0, W, halfH, 0, H - halfH, W, halfH)
+
+      // Step 2: mirror-fade across the now-middle horizontal seam.
+      const imageData = ctx.getImageData(0, 0, W, H)
+      const data = imageData.data
+      const snapshot = new Uint8ClampedArray(data)
+
+      const smoothstep = (t: number): number => {
+        const c = t < 0 ? 0 : t > 1 ? 1 : t
+        return c * c * (3 - 2 * c)
+      }
+
+      const key = options.ignoreKeyColor
+      const keyT = key?.threshold ?? 80
+      const keyTSq = keyT * keyT
+      const minAlpha = options.minAlpha ?? 0
+
+      const isKeyPixel = (r: number, g: number, b: number, a: number) => {
+        if (a < minAlpha) return true
+        if (!key) return false
+        const dr = r - key.r
+        const dg = g - key.g
+        const db = b - key.b
+        return dr * dr + dg * dg + db * db < keyTSq
+      }
+
+      const stripStart = Math.max(0, seamY - K)
+      const stripEnd = Math.min(H, seamY + K)
+
+      for (let y = stripStart; y < stripEnd; y++) {
+        for (let x = 0; x < W; x++) {
+          const idx = (y * W + x) * 4
+          const sR = snapshot[idx]
+          const sG = snapshot[idx + 1]
+          const sB = snapshot[idx + 2]
+          const sA = snapshot[idx + 3]
+          if (isKeyPixel(sR, sG, sB, sA)) continue
+
+          const mirrorY = 2 * seamY - 1 - y
+          if (mirrorY < 0 || mirrorY >= H) continue
+
+          const mIdx = (mirrorY * W + x) * 4
+          const mR = snapshot[mIdx]
+          const mG = snapshot[mIdx + 1]
+          const mB = snapshot[mIdx + 2]
+          const mA = snapshot[mIdx + 3]
+          if (isKeyPixel(mR, mG, mB, mA)) continue
+
+          const dist = Math.min(1, Math.abs(y - seamY + 0.5) / K)
+          const alphaMirror = 0.5 * smoothstep(1 - dist)
+          const alphaOrig = 1 - alphaMirror
+
+          const r = alphaOrig * sR + alphaMirror * mR
+          const g = alphaOrig * sG + alphaMirror * mG
+          const b = alphaOrig * sB + alphaMirror * mB
+          data[idx] = r < 0 ? 0 : r > 255 ? 255 : r
+          data[idx + 1] = g < 0 ? 0 : g > 255 ? 255 : g
+          data[idx + 2] = b < 0 ? 0 : b > 255 ? 255 : b
+        }
+      }
+      ctx.putImageData(imageData, 0, 0)
+
+      // Step 3: roll back so the user's "y=0" content stays at the top.
+      // The healed horizontal strip lands at the top↔bottom loop point.
+      const finalCanvas = document.createElement('canvas')
+      finalCanvas.width = W
+      finalCanvas.height = H
+      const finalCtx = finalCanvas.getContext('2d')
+      if (!finalCtx) {
+        reject(new Error('Failed to get final canvas context'))
+        return
+      }
+      finalCtx.drawImage(canvas, 0, halfH, W, H - halfH, 0, 0, W, H - halfH)
+      finalCtx.drawImage(canvas, 0, 0, W, halfH, 0, H - halfH, W, halfH)
+
+      resolve(finalCanvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = horizontallyTileable
+  })
+}
+
+/**
+ * Re-render an image at a target height while preserving its aspect ratio.
+ * Used in parallax mode to normalize an uploaded starter frame to a chosen
+ * game resolution height — keeps the workflow tidy when the user wants 1080,
+ * 720, etc. Returns the original data URL untouched if it already matches.
+ */
+export function fitImageToHeight(
+  imageDataUrl: string,
+  targetHeight: number
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      if (img.height === targetHeight) {
+        resolve(imageDataUrl)
+        return
+      }
+      const scale = targetHeight / img.height
+      const newWidth = Math.round(img.width * scale)
+      const canvas = document.createElement('canvas')
+      canvas.width = newWidth
+      canvas.height = targetHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('Failed to get canvas context'))
+        return
+      }
+      ctx.imageSmoothingEnabled = true
+      ctx.imageSmoothingQuality = 'high'
+      ctx.drawImage(img, 0, 0, newWidth, targetHeight)
+      resolve(canvas.toDataURL('image/png'))
+    }
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = imageDataUrl
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Sprite-sheet frame baseline alignment
+// ---------------------------------------------------------------------------
+//
+// Even with a structural guide image, multi-panel AI sprite generation can
+// drift on the y-axis from frame to frame — the model paints the character
+// 5–25 pixels higher or lower in some cells than others, producing a "feet
+// bouncing" flicker when the animation is played back at speed.
+//
+// The fix is purely post-process: once frames have been chroma-keyed to
+// transparency, we scan each frame's alpha channel from the bottom up to
+// detect the actual foot pixel coordinate, then translate the frame
+// vertically so every detected foot coordinate matches a shared target.
+// Detection uses opacity (not magenta) because the cells are already keyed.
+//
+// We use the MEDIAN of all bottoms as the target so the alignment is
+// robust to airborne outliers (jump apex, run mid-air recovery frames):
+// those frames have a wildly higher bottom and get filtered out before
+// they can poison the target. Frames that drift further than `maxShift`
+// from the target are treated as intentionally airborne and left alone.
+
+interface FrameAlignmentOptions {
+  /** Alpha (0–255) above which a pixel counts as "character" content.
+   *  Anti-aliased halo pixels are typically <16; we use 32 to be safe. */
+  alphaThreshold?: number
+  /** Minimum opaque pixels per row to accept that row as the bottom.
+   *  Guards against single stray pixels from chroma-key artifacts. */
+  minRowPixels?: number
+  /** Max absolute vertical shift (in pixels) to apply. Frames whose
+   *  detected bottom drifts more than this from the target are skipped
+   *  (assumed airborne). Defaults to 20% of the cell height. Ignored when
+   *  `groundAll` is true. */
+  maxShift?: number
+  /** When true, treat the animation as fully GROUNDED (no airborne frames):
+   *  EVERY frame is planted on the shared (median) baseline regardless of how
+   *  far it must move — no frame is exempted as "airborne". Use for idle /
+   *  walk / attack / hurt / death. Leave false for jump / run so apex frames
+   *  that drift past `maxShift` keep their lift. */
+  groundAll?: boolean
+}
+
+/**
+ * Find the y-coordinate of the character's foot baseline: the lowest row that
+ * is the bottom of a SOLID vertical run, not an isolated stray.
+ *
+ * Naively returning "the lowest row with ≥N opaque pixels" is fragile: a
+ * single line of chroma-key halo pixels, a faint anti-aliased edge, or a thin
+ * downward protrusion (a sword tip, a trailing cape) sits below the real feet
+ * and poisons the baseline for that one frame — which is the main source of
+ * per-frame baseline inconsistency. We instead require the detected bottom to
+ * cap a run of `runRows` consecutive substantive rows, so thin artifacts are
+ * ignored and we lock onto actual body mass (the foot).
+ */
+function findFrameBottomY(
+  imageData: ImageData,
+  alphaThreshold: number,
+  minRowPixels: number,
+  runRows: number
+): number {
+  const { data, width, height } = imageData
+  const counts = new Array<number>(height)
+  for (let y = 0; y < height; y++) {
+    let c = 0
+    const rowStart = y * width * 4
+    for (let x = 0; x < width; x++) {
+      if (data[rowStart + x * 4 + 3] > alphaThreshold) c++
+    }
+    counts[y] = c
+  }
+  // Lowest row that caps a run of `runRows` substantive rows (rejects strays).
+  for (let y = height - 1; y >= 0; y--) {
+    if (counts[y] < minRowPixels) continue
+    let run = 0
+    for (let k = 0; k < runRows && y - k >= 0; k++) {
+      if (counts[y - k] >= minRowPixels) run++
+      else break
+    }
+    if (run >= runRows) return y
+  }
+  // Fallback: lowest row with any content at all (very short/thin subjects).
+  for (let y = height - 1; y >= 0; y--) {
+    if (counts[y] >= 1) return y
+  }
+  return -1
+}
+
+/**
+ * Translate a chroma-keyed cell vertically by `shiftY` pixels, returning
+ * a fresh PNG data URL. Positive `shiftY` moves content DOWN (top rows
+ * become transparent, bottom rows clip off). Negative moves UP.
+ */
+function shiftCellVertical(
+  img: HTMLImageElement,
+  shiftY: number
+): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = img.width
+  canvas.height = img.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Failed to get canvas context')
+  ctx.imageSmoothingEnabled = false
+  ctx.drawImage(img, 0, shiftY)
+  return canvas.toDataURL('image/png')
+}
+
+function loadImageFromUrl(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Failed to load image'))
+    img.src = url
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Uploaded-character background cleanup
+// ---------------------------------------------------------------------------
+//
+// Users often upload an asset that LOOKS transparent but actually has a
+// checkerboard (or plain/solid) background baked into the pixels — e.g. a
+// screenshot of a transparent sprite from an editor. Our chroma-key only
+// strips magenta, so that baked background would otherwise be treated as part
+// of the art by the model.
+//
+// This pass removes such a background by flood-filling inward from the image
+// edges, clearing pixels that look like background:
+//   • the editor "transparency" checkerboard (light + de-saturated greys), or
+//   • a solid backdrop matching the sampled corner color.
+// Because it only removes regions CONNECTED to the border, interior light
+// areas of the character (white collar, etc.) are preserved.
+//
+// CRITICAL: if the image already carries real transparency, we assume it's a
+// clean asset and return it untouched — so this never damages proper PNGs.
+
+interface UploadBackgroundOptions {
+  /** If the fraction of already-transparent pixels exceeds this, the image is
+   *  treated as a clean transparent asset and returned unchanged. */
+  transparentSkipFraction?: number
+  /** Max dimension to process at (keeps the flood fill cheap on huge uploads). */
+  maxSize?: number
+}
+
+export async function removeUploadedBackground(
+  dataUrl: string,
+  opts: UploadBackgroundOptions = {}
+): Promise<string> {
+  const transparentSkipFraction = opts.transparentSkipFraction ?? 0.02
+  const maxSize = opts.maxSize ?? 1024
+
+  const img = await loadImageFromUrl(dataUrl)
+  let w = img.width
+  let h = img.height
+  if (!w || !h) return dataUrl
+  // Downscale only for processing if absurdly large; otherwise keep native.
+  const scale = Math.min(1, maxSize / Math.max(w, h))
+  w = Math.max(1, Math.round(w * scale))
+  h = Math.max(1, Math.round(h * scale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return dataUrl
+  ctx.imageSmoothingEnabled = true
+  ctx.drawImage(img, 0, 0, w, h)
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const { data } = imageData
+  const n = w * h
+
+  // Already transparent? Treat as a clean asset and leave it alone.
+  let transparent = 0
+  for (let i = 0; i < n; i++) {
+    if (data[i * 4 + 3] < 200) transparent++
+  }
+  if (transparent / n > transparentSkipFraction) return dataUrl
+
+  // Sample the four corners to characterize a possible solid backdrop.
+  const corners = [
+    [0, 0],
+    [w - 1, 0],
+    [0, h - 1],
+    [w - 1, h - 1],
+  ].map(([x, y]) => {
+    const i = (y * w + x) * 4
+    return [data[i], data[i + 1], data[i + 2]] as [number, number, number]
+  })
+  const avgCorner: [number, number, number] = [
+    Math.round(corners.reduce((s, c) => s + c[0], 0) / corners.length),
+    Math.round(corners.reduce((s, c) => s + c[1], 0) / corners.length),
+    Math.round(corners.reduce((s, c) => s + c[2], 0) / corners.length),
+  ]
+  // Are the corners consistent enough to call it a single solid backdrop?
+  const cornerSpread = Math.max(
+    ...corners.map((c) =>
+      Math.max(
+        Math.abs(c[0] - avgCorner[0]),
+        Math.abs(c[1] - avgCorner[1]),
+        Math.abs(c[2] - avgCorner[2])
+      )
+    )
+  )
+  const solidBackdrop = cornerSpread < 24
+
+  const isCheckerLike = (r: number, g: number, b: number): boolean => {
+    const max = Math.max(r, g, b)
+    const min = Math.min(r, g, b)
+    // Light and nearly grey — covers both the white and grey checker squares.
+    return max > 175 && max - min < 38
+  }
+  const matchesCorner = (r: number, g: number, b: number): boolean => {
+    if (!solidBackdrop) return false
+    return (
+      Math.abs(r - avgCorner[0]) +
+        Math.abs(g - avgCorner[1]) +
+        Math.abs(b - avgCorner[2]) <
+      60
+    )
+  }
+  const isBackground = (idx: number): boolean => {
+    const i = idx * 4
+    if (data[i + 3] < 16) return true
+    const r = data[i]
+    const g = data[i + 1]
+    const b = data[i + 2]
+    return isCheckerLike(r, g, b) || matchesCorner(r, g, b)
+  }
+
+  // BFS flood fill from every border pixel through background-like pixels.
+  const visited = new Uint8Array(n)
+  const queue: number[] = []
+  const pushIf = (idx: number) => {
+    if (idx < 0 || idx >= n) return
+    if (visited[idx]) return
+    visited[idx] = 1
+    if (isBackground(idx)) queue.push(idx)
+  }
+  for (let x = 0; x < w; x++) {
+    pushIf(x)
+    pushIf((h - 1) * w + x)
+  }
+  for (let y = 0; y < h; y++) {
+    pushIf(y * w)
+    pushIf(y * w + (w - 1))
+  }
+  let removed = 0
+  while (queue.length) {
+    const idx = queue.pop() as number
+    data[idx * 4 + 3] = 0
+    removed++
+    const x = idx % w
+    const y = (idx / w) | 0
+    if (x > 0) pushIf(idx - 1)
+    if (x < w - 1) pushIf(idx + 1)
+    if (y > 0) pushIf(idx - w)
+    if (y < h - 1) pushIf(idx + w)
+  }
+
+  // Nothing looked like background — return original to be safe.
+  if (removed === 0) return dataUrl
+
+  ctx.putImageData(imageData, 0, 0)
+  return canvas.toDataURL('image/png')
+}
+
+/**
+ * Align an array of chroma-keyed sprite-cell PNGs so their detected foot
+ * baselines share a common y-coordinate. Returns the aligned cells in the
+ * same order, plus diagnostic info about what was detected.
+ *
+ * Algorithm:
+ *   1. Decode each cell's alpha channel to find its bottom y.
+ *   2. Compute the MEDIAN of the detected bottoms (robust to outliers).
+ *   3. For each cell, compute delta = median - cellBottom.
+ *      - |delta| ≤ maxShift → translate cell by delta px (alignment).
+ *      - |delta|  > maxShift → leave cell alone (assumed airborne).
+ *      - cellBottom = -1 → leave cell alone (empty frame).
+ *
+ * Input cells are expected to be the same size; mismatched sizes still
+ * work but the maxShift default is computed from the first cell.
+ */
+export async function alignSpriteFramesToBaseline(
+  cells: string[],
+  opts: FrameAlignmentOptions = {}
+): Promise<{
+  cells: string[]
+  targetBaseline: number | null
+  detected: number[]
+  shifted: number[]
+}> {
+  if (cells.length === 0) {
+    return { cells, targetBaseline: null, detected: [], shifted: [] }
+  }
+
+  // Ignore faint chroma-key halo (semi-transparent edge pixels) by requiring a
+  // reasonably opaque pixel, and reject thin strays via the run requirement.
+  const alphaThreshold = opts.alphaThreshold ?? 64
+  const minRowPixels = opts.minRowPixels ?? 4
+  const groundAll = opts.groundAll ?? false
+
+  const images = await Promise.all(cells.map((c) => loadImageFromUrl(c)))
+  const cellHeight = images[0]?.height ?? 512
+  const maxShift = opts.maxShift ?? Math.floor(cellHeight * 0.2)
+  const runRows = Math.max(3, Math.round(cellHeight * 0.012))
+
+  // Extract bottoms.
+  const detected: number[] = images.map((img) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = img.width
+    canvas.height = img.height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return -1
+    ctx.drawImage(img, 0, 0)
+    const data = ctx.getImageData(0, 0, img.width, img.height)
+    return findFrameBottomY(data, alphaThreshold, minRowPixels, runRows)
+  })
+
+  // Median over valid (non -1) bottoms. If none are valid, return
+  // unchanged. The MEDIAN is deliberately robust: a single frame whose
+  // detected bottom is still off (residual artifact, or a genuinely lower
+  // pose) cannot drag the whole sheet's baseline with it. In the common case
+  // the bottoms cluster tightly, so the median IS the true foot line; when a
+  // whole row has drifted high, the median lands on the larger (grounded)
+  // cluster, pulling the drifted row down to it.
+  const validBottoms = detected.filter((b) => b >= 0).sort((a, b) => a - b)
+  if (validBottoms.length === 0) {
+    return { cells, targetBaseline: null, detected, shifted: detected.map(() => 0) }
+  }
+  const targetBaseline = validBottoms[Math.floor(validBottoms.length / 2)]
+
+  // Shift each cell.
+  const aligned: string[] = []
+  const shifts: number[] = []
+  for (let i = 0; i < cells.length; i++) {
+    const bottom = detected[i]
+    if (bottom < 0) {
+      aligned.push(cells[i])
+      shifts.push(0)
+      continue
+    }
+    const delta = targetBaseline - bottom
+    if (!groundAll && Math.abs(delta) > maxShift) {
+      // Airborne / outlier frame — preserve (only when the anim can have
+      // airborne frames; grounded anims always plant every frame).
+      aligned.push(cells[i])
+      shifts.push(0)
+      continue
+    }
+    if (Math.abs(delta) < 1) {
+      // Already aligned.
+      aligned.push(cells[i])
+      shifts.push(0)
+      continue
+    }
+    try {
+      aligned.push(shiftCellVertical(images[i], delta))
+      shifts.push(delta)
+    } catch {
+      aligned.push(cells[i])
+      shifts.push(0)
+    }
+  }
+
+  return {
+    cells: aligned,
+    targetBaseline,
+    detected,
+    shifted: shifts,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sprite-sheet frame-border cleanup
+// ---------------------------------------------------------------------------
+//
+// The model sometimes paints faint cell-divider lines on the sheet (a thin
+// dark rectangle around each cell) even though the prompt forbids it. Those
+// lines aren't magenta, so chroma-keying leaves them in place and every sliced
+// frame ends up with a dark square border around it.
+//
+// This pass erases that border: for each of the 4 edges it scans a thin band
+// inward and clears any row/column that is "border-like" — i.e. opaque across
+// most of the edge's length. A real character never forms a near-full-width
+// opaque line right at a cell edge (it's centered with margin), so this only
+// catches divider lines, not the character.
+
+interface BorderCleanupOptions {
+  /** Fraction of an edge's length that must be opaque for the row/col to be
+   *  treated as a border line. High enough that character limbs/feet never
+   *  trip it. Default 0.7. */
+  coverage?: number
+  /** How far inward to look for border lines, as a fraction of cell size.
+   *  Default 0.03 (≈15px on a 512 cell) to also catch borders inset a few px. */
+  bandFraction?: number
+  /** Alpha above which a pixel counts as opaque. Default 24 (catches even
+   *  semi-transparent divider lines). */
+  alphaThreshold?: number
+}
+
+/**
+ * Erase full-span border lines from the edges of a single chroma-keyed cell.
+ * Returns a fresh PNG data URL (unchanged if no border is detected).
+ */
+export async function removeFrameBorder(
+  cellDataUrl: string,
+  opts: BorderCleanupOptions = {}
+): Promise<string> {
+  const coverage = opts.coverage ?? 0.7
+  const bandFraction = opts.bandFraction ?? 0.03
+  const alphaThreshold = opts.alphaThreshold ?? 24
+
+  const img = await loadImageFromUrl(cellDataUrl)
+  const w = img.width
+  const h = img.height
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return cellDataUrl
+  ctx.drawImage(img, 0, 0)
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const { data } = imageData
+
+  const band = Math.max(2, Math.round(Math.min(w, h) * bandFraction))
+  const rowNeed = Math.round(w * coverage)
+  const colNeed = Math.round(h * coverage)
+  let changed = false
+
+  const rowOpaque = (y: number): number => {
+    let c = 0
+    const rs = y * w * 4
+    for (let x = 0; x < w; x++) if (data[rs + x * 4 + 3] > alphaThreshold) c++
+    return c
+  }
+  const colOpaque = (x: number): number => {
+    let c = 0
+    for (let y = 0; y < h; y++) if (data[(y * w + x) * 4 + 3] > alphaThreshold) c++
+    return c
+  }
+  const clearRow = (y: number) => {
+    const rs = y * w * 4
+    for (let x = 0; x < w; x++) data[rs + x * 4 + 3] = 0
+  }
+  const clearCol = (x: number) => {
+    for (let y = 0; y < h; y++) data[(y * w + x) * 4 + 3] = 0
+  }
+
+  for (let k = 0; k < band; k++) {
+    if (rowOpaque(k) >= rowNeed) {
+      clearRow(k)
+      changed = true
+    }
+    if (rowOpaque(h - 1 - k) >= rowNeed) {
+      clearRow(h - 1 - k)
+      changed = true
+    }
+    if (colOpaque(k) >= colNeed) {
+      clearCol(k)
+      changed = true
+    }
+    if (colOpaque(w - 1 - k) >= colNeed) {
+      clearCol(w - 1 - k)
+      changed = true
+    }
+  }
+
+  if (!changed) return cellDataUrl
+  ctx.putImageData(imageData, 0, 0)
+  return canvas.toDataURL('image/png')
+}
+
+// ---------------------------------------------------------------------------
+// Sprite-sheet horizontal centering
+// ---------------------------------------------------------------------------
+//
+// Companion to the baseline (vertical) pass. The model sometimes paints the
+// character offset to one side of a cell, or lets it slide left/right across
+// frames so an "in place" walk/run looks like it's drifting. This pass scans
+// each chroma-keyed cell, finds the character's horizontal CENTER OF MASS
+// (centroid of opaque pixels — robust against a thin protrusion like a drawn
+// sword or a swinging arm, which a bounding-box midpoint would over-weight),
+// then translates the cell horizontally so that center lands on a shared
+// target. The default target is the exact cell center, which both centers the
+// character and pins it "in place" frame-to-frame.
+
+interface FrameCenterOptions {
+  /** Alpha (0–255) above which a pixel counts as character content. */
+  alphaThreshold?: number
+  /** Minimum opaque pixels required to trust the centroid (skips empty cells). */
+  minPixels?: number
+  /** 'cellCenter' (default) centers each frame's mass at width/2. 'shared'
+   *  instead aligns every frame to the MEDIAN centroid — removes drift between
+   *  frames without forcing dead-center, useful if the art is intentionally
+   *  off-center but should stay put. */
+  mode?: 'cellCenter' | 'shared'
+  /** Max absolute horizontal shift (px). Guards against a bad detection
+   *  shoving a frame off-screen. Defaults to 40% of the cell width. */
+  maxShift?: number
+}
+
+/** Horizontal center of mass of opaque pixels; -1 if too few pixels. */
+function findFrameCentroidX(
+  imageData: ImageData,
+  alphaThreshold: number,
+  minPixels: number
+): number {
+  const { data, width, height } = imageData
+  let sumX = 0
+  let count = 0
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * width * 4
+    for (let x = 0; x < width; x++) {
+      if (data[rowStart + x * 4 + 3] > alphaThreshold) {
+        sumX += x
+        count++
+      }
+    }
+  }
+  if (count < minPixels) return -1
+  return sumX / count
+}
+
+/** Translate a cell horizontally by `shiftX` px (positive = right). */
+function shiftCellHorizontal(img: HTMLImageElement, shiftX: number): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = img.width
+  canvas.height = img.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Failed to get canvas context')
+  ctx.imageSmoothingEnabled = false
+  ctx.drawImage(img, shiftX, 0)
+  return canvas.toDataURL('image/png')
+}
+
+/**
+ * Center an array of chroma-keyed sprite cells horizontally so each
+ * character's center of mass lands on a shared target (the cell center by
+ * default). Returns the centered cells in order plus diagnostics.
+ */
+export async function centerSpriteFramesHorizontally(
+  cells: string[],
+  opts: FrameCenterOptions = {}
+): Promise<{
+  cells: string[]
+  targetCenterX: number | null
+  detected: number[]
+  shifted: number[]
+}> {
+  if (cells.length === 0) {
+    return { cells, targetCenterX: null, detected: [], shifted: [] }
+  }
+
+  const alphaThreshold = opts.alphaThreshold ?? 32
+  const minPixels = opts.minPixels ?? 24
+  const mode = opts.mode ?? 'cellCenter'
+
+  const images = await Promise.all(cells.map((c) => loadImageFromUrl(c)))
+  const cellWidth = images[0]?.width ?? 512
+  const maxShift = opts.maxShift ?? Math.floor(cellWidth * 0.4)
+
+  const detected: number[] = images.map((img) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = img.width
+    canvas.height = img.height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return -1
+    ctx.drawImage(img, 0, 0)
+    const data = ctx.getImageData(0, 0, img.width, img.height)
+    return findFrameCentroidX(data, alphaThreshold, minPixels)
+  })
+
+  const validCenters = detected.filter((c) => c >= 0).sort((a, b) => a - b)
+  if (validCenters.length === 0) {
+    return {
+      cells,
+      targetCenterX: null,
+      detected,
+      shifted: detected.map(() => 0),
+    }
+  }
+
+  const targetCenterX =
+    mode === 'shared'
+      ? validCenters[Math.floor(validCenters.length / 2)]
+      : cellWidth / 2
+
+  const centered: string[] = []
+  const shifts: number[] = []
+  for (let i = 0; i < cells.length; i++) {
+    const cx = detected[i]
+    if (cx < 0) {
+      centered.push(cells[i])
+      shifts.push(0)
+      continue
+    }
+    let delta = Math.round(targetCenterX - cx)
+    if (Math.abs(delta) > maxShift) {
+      delta = Math.sign(delta) * maxShift
+    }
+    if (Math.abs(delta) < 1) {
+      centered.push(cells[i])
+      shifts.push(0)
+      continue
+    }
+    try {
+      centered.push(shiftCellHorizontal(images[i], delta))
+      shifts.push(delta)
+    } catch {
+      centered.push(cells[i])
+      shifts.push(0)
+    }
+  }
+
+  return { cells: centered, targetCenterX, detected, shifted: shifts }
+}

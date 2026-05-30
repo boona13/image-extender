@@ -73,6 +73,8 @@ export async function POST(request: NextRequest) {
       attempt = 0,
       apiKey,
       model,
+      layerRole,
+      sceneBrief,
     } = await request.json()
 
     if (!expandedCanvas || !direction || !extensionAmount) {
@@ -231,6 +233,42 @@ KEY INSTRUCTIONS:
       prompt += `\n   - Avoid mechanical repetition — small natural variation in textures and shapes is good (e.g., slightly different cloud forms, organic terrain undulation, varied foliage)`
       prompt += `\n   - The new area should look like more of the same environment a real camera would capture if panned/tilted in that direction — nothing more, nothing less`
       prompt += `\n   - Match exact color, brightness, contrast, and saturation at the boundary`
+    }
+
+    // Parallax layer extensions need extra discipline: the keyed layers must
+    // keep their magenta background pure across the new area, and the sky
+    // layer must stay opaque without introducing fake silhouettes.
+    const KEY_COLOR_HEX = '#FF00FF'
+    if (typeof layerRole === 'string') {
+      if (layerRole === 'sky') {
+        prompt += `\n\nPARALLAX LAYER — SKY / BACK (must tile horizontally):
+- This image is the back-most opaque layer of a parallax scene. The new area must continue the same sky / atmosphere / very-distant horizon only — do NOT introduce mid-ground or foreground elements. Keep the result fully opaque, no transparency, no magenta.
+- HORIZONTALLY UNIFORM TONE is required for tileability:
+  • The sky tone (color, brightness, saturation) must be IDENTICAL at every X position, including the new area you fill — no left-to-right gradient, no warm-to-cool drift, no one-side-darker-than-the-other.
+  • Any gradient must run TOP-TO-BOTTOM ONLY. If the existing image already has a top-to-bottom gradient, copy that exact gradient column-for-column into the new area; every horizontal row at the same Y must end up the same color across the whole result.
+  • Do NOT introduce a sun, moon, sunbeams, sunrise/sunset glow, gradient backlighting, vignettes, or any directional light source. If the existing image contains any such directional lighting, blend it OUT in the new area so the result becomes horizontally uniform.
+  • Cloud distribution should be roughly even across X — do not concentrate clouds on one side of the new area.`
+      } else if (
+        layerRole === 'far' ||
+        layerRole === 'mid' ||
+        layerRole === 'near'
+      ) {
+        const roleDesc =
+          layerRole === 'far'
+            ? 'far-distant silhouettes only (distant mountains, faint horizon line)'
+            : layerRole === 'mid'
+              ? 'mid-distance scene elements only (mid-size trees, buildings, terrain features)'
+              : 'near foreground elements only (near grass, foreground bushes, rocks, near tree trunks)'
+        prompt += `\n\nPARALLAX LAYER — ${layerRole.toUpperCase()} (alpha-keyed):
+- This image is a parallax layer where everything OUTSIDE the actual scene elements is a perfectly flat solid pure magenta color exactly ${KEY_COLOR_HEX} (R=255, G=0, B=255). That magenta will be removed by the client and replaced with transparency.
+- In the new area you fill, render ONLY ${roleDesc}. Everywhere else in the new area MUST also be the same flat solid ${KEY_COLOR_HEX} magenta — no other background colors, no sky, no other layers' content.
+- Continue the existing elements naturally into the new area. Element silhouettes should be crisp against the magenta to minimize halos.
+- Do NOT change the magenta background color in any region — it must stay pure ${KEY_COLOR_HEX} everywhere outside the elements, both in the existing area and in the new area.`
+      }
+    }
+
+    if (typeof sceneBrief === 'string' && sceneBrief.trim()) {
+      prompt += `\n\nSHARED SCENE DIRECTION — maintain this art direction exactly in the new area (palette, lighting, mood, style). Do not drift from it:\n${sceneBrief.trim()}`
     }
 
     prompt += `\n\nFINAL OUTPUT: Return the complete image with the blank area filled. The result must look like a single, unified ${artStyle && artStyleDescriptions[artStyle] ? 'artistic work' : 'scene'} with absolutely no visible seams. The boundary should be completely invisible.`

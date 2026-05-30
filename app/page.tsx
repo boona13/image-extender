@@ -1,1542 +1,26 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
-import {
-  createChunkedExtension,
-  createFullContextExtension,
-  applyFullContextResult,
-  isAiExtensionUnfilled,
-  measureSeamResidual,
-  stitchExtendedChunk,
-} from './utils/imageProcessor'
-
-type Direction = 'up' | 'down' | 'left' | 'right'
-
-/**
- * One generated extension result. For horizontal extensions we produce up to
- * `maxAttempts` candidates, sort them by seam quality (lowest residual first),
- * and let the user cycle through them before accepting. Vertical extensions
- * produce a single candidate (the chunked path is deterministic enough that
- * multiple tries rarely help).
- */
-type Candidate = {
-  /** Fully blended, ready-to-display image data URL. */
-  imageUrl: string
-  /** Mean color difference at the seam — lower = cleaner blend. */
-  score: number
-  /** 1-indexed generation order, useful for debug logging. */
-  attempt: number
-}
-
-/**
- * Extension percent is fixed in code. 38% is the sweet spot we converged on —
- * large enough to feel useful, small enough that the AI keeps the scene
- * coherent. Iterative extensions chain naturally if the user wants more.
- */
-const EXTENSION_PERCENT = 38
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OpenRouter integration — BYOK (bring your own key) for open-source friendliness
-// ─────────────────────────────────────────────────────────────────────────────
-
-type ModelOption = {
-  value: string
-  label: string
-  hint?: string
-  /**
-   * Max best-of-N attempts for horizontal extensions on this model.
-   * Slow models (GPT-5.4-image-2 takes ~4 min/call) get 1 to avoid
-   * multi-minute blind waits; fast models get 3 for seam-quality picking.
-   */
-  maxAttempts: number
-  /** Rough single-call expected duration, shown to the user as guidance. */
-  approxSecondsPerCall: number
-}
-
-const MODELS: ModelOption[] = [
-  {
-    value: 'google/gemini-3.1-flash-image-preview',
-    label: 'Gemini 3 Flash Image',
-    hint: 'Nano Banana 2 · fast · default',
-    maxAttempts: 3,
-    approxSecondsPerCall: 18,
-  },
-  {
-    value: 'google/gemini-2.5-flash-image',
-    label: 'Gemini 2.5 Flash Image',
-    hint: 'Nano Banana · stable',
-    maxAttempts: 3,
-    approxSecondsPerCall: 15,
-  },
-]
-
-const DEFAULT_MODEL = MODELS[0].value
-
-function getModelConfig(value: string): ModelOption {
-  return MODELS.find((m) => m.value === value) || MODELS[0]
-}
-
-const STORAGE_KEY = 'extender:api_key'
-const STORAGE_MODEL = 'extender:model'
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Inline icons — minimal SVG primitives, zero dependencies
-// ─────────────────────────────────────────────────────────────────────────────
-
-type IconProps = { size?: number; className?: string }
-const svg = (path: React.ReactNode, viewBox = '0 0 24 24'): React.FC<IconProps> =>
-  function Icon({ size = 18, className }) {
-    return (
-      <svg
-        width={size}
-        height={size}
-        viewBox={viewBox}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1.75}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className={className}
-        aria-hidden="true"
-      >
-        {path}
-      </svg>
-    )
-  }
-
-const Icons = {
-  ArrowUp: svg(<path d="M12 19V5M5 12l7-7 7 7" />),
-  ArrowDown: svg(<path d="M12 5v14M19 12l-7 7-7-7" />),
-  ArrowLeft: svg(<path d="M19 12H5M12 19l-7-7 7-7" />),
-  ArrowRight: svg(<path d="M5 12h14M12 5l7 7-7 7" />),
-  Settings: svg(
-    <>
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
-    </>
-  ),
-  Sparkle: svg(
-    <path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3zM19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14zM5 5l.6 1.7L7.3 7.3 5.6 7.9 5 9.6l-.6-1.7L2.7 7.3l1.7-.6L5 5z" />
-  ),
-  Check: svg(<polyline points="20 6 9 17 4 12" />),
-  X: svg(<path d="M18 6L6 18M6 6l12 12" />),
-  Refresh: svg(
-    <>
-      <polyline points="1 4 1 10 7 10" />
-      <polyline points="23 20 23 14 17 14" />
-      <path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15" />
-    </>
-  ),
-  Download: svg(
-    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
-  ),
-  Upload: svg(
-    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
-  ),
-  Plus: svg(<path d="M12 5v14M5 12h14" />),
-  Spinner: ({ size = 18, className }: IconProps) => (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      className={`${className ?? ''} animate-spin`}
-      aria-hidden="true"
-    >
-      <circle
-        cx="12"
-        cy="12"
-        r="9"
-        stroke="currentColor"
-        strokeWidth="2"
-        fill="none"
-        opacity="0.25"
-      />
-      <path
-        d="M21 12a9 9 0 0 0-9-9"
-        stroke="currentColor"
-        strokeWidth="2"
-        fill="none"
-        strokeLinecap="round"
-      />
-    </svg>
-  ),
-  CornerFrame: svg(
-    <>
-      <path d="M3 9V5a2 2 0 0 1 2-2h4" />
-      <path d="M21 9V5a2 2 0 0 0-2-2h-4" />
-      <path d="M3 15v4a2 2 0 0 0 2 2h4" />
-      <path d="M21 15v4a2 2 0 0 1-2 2h-4" />
-    </>
-  ),
-  Eye: svg(
-    <>
-      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z" />
-      <circle cx="12" cy="12" r="3" />
-    </>
-  ),
-  EyeOff: svg(
-    <>
-      <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
-      <line x1="1" y1="1" x2="23" y2="23" />
-    </>
-  ),
-  Key: svg(
-    <>
-      <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-    </>
-  ),
-  External: svg(
-    <>
-      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-      <polyline points="15 3 21 3 21 9" />
-      <line x1="10" y1="14" x2="21" y2="3" />
-    </>
-  ),
-  AlertTriangle: svg(
-    <>
-      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-      <line x1="12" y1="9" x2="12" y2="13" />
-      <line x1="12" y1="17" x2="12.01" y2="17" />
-    </>
-  ),
-  Trash: svg(
-    <>
-      <polyline points="3 6 5 6 21 6" />
-      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-      <path d="M10 11v6M14 11v6" />
-      <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
-    </>
-  ),
-}
-
-/** Mask all but the last 4 chars of an API key for display. */
-function maskKey(key: string): string {
-  if (!key) return ''
-  const tail = key.slice(-4)
-  return `${'•'.repeat(Math.max(4, Math.min(20, key.length - 4)))}${tail}`
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Art styles — flat list with optional grouping for the dropdown
-// ─────────────────────────────────────────────────────────────────────────────
-
-const ART_STYLE_GROUPS: { label: string; options: { value: string; label: string }[] }[] = [
-  {
-    label: 'Match original',
-    options: [{ value: 'none', label: 'Match original style' }],
-  },
-  {
-    label: 'Photography',
-    options: [
-      { value: 'cinematic', label: 'Cinematic' },
-      { value: 'vintage', label: 'Vintage film' },
-      { value: 'black-white', label: 'Black & white' },
-      { value: 'macro', label: 'Macro' },
-    ],
-  },
-  {
-    label: 'Painting',
-    options: [
-      { value: 'oil-painting', label: 'Oil painting' },
-      { value: 'watercolor', label: 'Watercolor' },
-      { value: 'impressionism', label: 'Impressionism' },
-      { value: 'abstract', label: 'Abstract' },
-      { value: 'pop-art', label: 'Pop art' },
-      { value: 'cubism', label: 'Cubism' },
-      { value: 'minimalist', label: 'Minimalist' },
-    ],
-  },
-  {
-    label: 'Digital',
-    options: [
-      { value: 'digital-art', label: 'Digital art' },
-      { value: 'cyberpunk', label: 'Cyberpunk' },
-      { value: 'vaporwave', label: 'Vaporwave' },
-      { value: 'low-poly', label: 'Low poly' },
-      { value: 'pixel-art', label: 'Pixel art' },
-      { value: '3d-render', label: '3D render' },
-    ],
-  },
-  {
-    label: 'Illustration',
-    options: [
-      { value: 'anime', label: 'Anime' },
-      { value: 'cartoon', label: 'Cartoon' },
-      { value: 'comic-book', label: 'Comic book' },
-      { value: 'sketch', label: 'Pencil sketch' },
-      { value: 'ink', label: 'Ink drawing' },
-    ],
-  },
-  {
-    label: 'Animation studios',
-    options: [
-      { value: 'studio-ghibli', label: 'Studio Ghibli' },
-      { value: 'pixar', label: 'Pixar' },
-      { value: 'disney', label: 'Disney' },
-      { value: 'dreamworks', label: 'DreamWorks' },
-      { value: 'illumination', label: 'Illumination' },
-      { value: 'laika', label: 'Laika' },
-      { value: 'cartoon-network', label: 'Cartoon Network' },
-      { value: 'nickelodeon', label: 'Nickelodeon' },
-      { value: 'aardman', label: 'Aardman' },
-      { value: 'blue-sky', label: 'Blue Sky' },
-    ],
-  },
-  {
-    label: 'Fantasy & retro',
-    options: [
-      { value: 'fantasy', label: 'Fantasy' },
-      { value: 'sci-fi', label: 'Sci-fi' },
-      { value: 'steampunk', label: 'Steampunk' },
-      { value: 'surreal', label: 'Surreal' },
-      { value: 'art-deco', label: 'Art Deco' },
-      { value: 'art-nouveau', label: 'Art Nouveau' },
-      { value: 'retro-80s', label: '80s retro' },
-      { value: 'retro-50s', label: '50s vintage' },
-    ],
-  },
-]
-
-const findStyleLabel = (value: string) => {
-  for (const group of ART_STYLE_GROUPS) {
-    const opt = group.options.find((o) => o.value === value)
-    if (opt) return opt.label
-  }
-  return 'Match original'
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Small presentational components
-// ─────────────────────────────────────────────────────────────────────────────
-
-function Logo() {
-  return (
-    <div className="flex items-center gap-2.5">
-      <div
-        className="flex h-7 w-7 items-center justify-center rounded-md"
-        style={{
-          background: 'linear-gradient(135deg, var(--accent), #e07b00)',
-          color: '#1a1404',
-        }}
-      >
-        <Icons.CornerFrame size={16} />
-      </div>
-      <div className="flex items-baseline gap-1.5">
-        <span className="text-[15px] font-semibold tracking-tight">Extender</span>
-        <span className="text-[11px] font-mono text-[var(--text-muted)]">v2</span>
-      </div>
-    </div>
-  )
-}
-
-function TopBar({
-  hasImage,
-  onNewImage,
-  onShowSettings,
-}: {
-  hasImage: boolean
-  onNewImage: () => void
-  onShowSettings: () => void
-}) {
-  return (
-    <header
-      className="relative z-20 flex h-14 shrink-0 items-center justify-between border-b px-4 sm:px-6"
-      style={{ borderColor: 'var(--border)' }}
-    >
-      <Logo />
-      <div className="flex items-center gap-1.5">
-        {hasImage && (
-          <button onClick={onNewImage} className="btn btn-ghost">
-            <Icons.Plus size={15} />
-            New image
-          </button>
-        )}
-        <button
-          onClick={onShowSettings}
-          className="icon-btn"
-          aria-label="Settings"
-          title="Settings"
-        >
-          <Icons.Settings size={17} />
-        </button>
-      </div>
-    </header>
-  )
-}
-
-function StatusPill({
-  status,
-  message,
-}: {
-  status: 'idle' | 'working' | 'error' | 'ok'
-  message: string
-}) {
-  const color =
-    status === 'error'
-      ? 'var(--danger)'
-      : status === 'ok'
-        ? 'var(--success)'
-        : status === 'working'
-          ? 'var(--accent)'
-          : 'var(--text-muted)'
-  return (
-    <div
-      className="anim-slide-down flex items-center gap-2 rounded-full border px-3 py-1.5 text-[12px]"
-      style={{
-        borderColor: 'var(--border)',
-        background: 'var(--bg-elev)',
-        color,
-      }}
-    >
-      {status === 'working' ? (
-        <Icons.Spinner size={12} />
-      ) : (
-        <span
-          className="inline-block h-1.5 w-1.5 rounded-full"
-          style={{ background: 'currentColor' }}
-        />
-      )}
-      <span style={{ color: 'var(--text-secondary)' }}>{message}</span>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Edge handles — spatial direction selectors that sit ON the image edges
-// ─────────────────────────────────────────────────────────────────────────────
-
-function EdgeHandle({
-  direction,
-  onClick,
-  active,
-  disabled,
-}: {
-  direction: Direction
-  onClick: (d: Direction) => void
-  active: boolean
-  disabled: boolean
-}) {
-  const Icon = {
-    up: Icons.ArrowUp,
-    down: Icons.ArrowDown,
-    left: Icons.ArrowLeft,
-    right: Icons.ArrowRight,
-  }[direction]
-
-  const position: React.CSSProperties = {
-    up: { top: -22, left: '50%', transform: 'translateX(-50%)' },
-    down: { bottom: -22, left: '50%', transform: 'translateX(-50%)' },
-    left: { left: -22, top: '50%', transform: 'translateY(-50%)' },
-    right: { right: -22, top: '50%', transform: 'translateY(-50%)' },
-  }[direction]
-
-  return (
-    <button
-      onClick={() => onClick(direction)}
-      disabled={disabled}
-      title={`Extend ${direction}`}
-      aria-label={`Extend ${direction}`}
-      className={`group absolute z-10 flex h-11 w-11 items-center justify-center rounded-full transition-all duration-200 ${
-        active ? 'anim-pulse' : ''
-      }`}
-      style={{
-        ...position,
-        background: active ? 'var(--accent)' : 'var(--bg-elev)',
-        border: `1px solid ${active ? 'var(--accent)' : 'var(--border-strong)'}`,
-        color: active ? '#1a1404' : 'var(--text-secondary)',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-        opacity: disabled && !active ? 0.4 : 1,
-      }}
-      onMouseEnter={(e) => {
-        if (disabled) return
-        e.currentTarget.style.borderColor = 'var(--accent)'
-        e.currentTarget.style.color = active ? '#1a1404' : 'var(--accent)'
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.borderColor = active
-          ? 'var(--accent)'
-          : 'var(--border-strong)'
-        e.currentTarget.style.color = active ? '#1a1404' : 'var(--text-secondary)'
-      }}
-    >
-      <Icon size={18} />
-    </button>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Workspace — image with edge handles, dimensions label, and result actions
-// ─────────────────────────────────────────────────────────────────────────────
-
-function Workspace({
-  image,
-  dimensions,
-  onExtend,
-  activeDirection,
-  loading,
-  progressMessage,
-  isResult,
-  resultMessage,
-  variantSelector,
-  resultActions,
-}: {
-  image: string
-  dimensions: { width: number; height: number } | null
-  onExtend: (d: Direction) => void
-  activeDirection: Direction | null
-  loading: boolean
-  progressMessage?: string | null
-  isResult: boolean
-  resultMessage?: string
-  /**
-   * Optional cycle-between-variants control rendered next to the dimension
-   * pill. Only shown when the current extension produced more than one
-   * candidate.
-   */
-  variantSelector?: React.ReactNode
-  resultActions?: React.ReactNode
-}) {
-  return (
-    <div className="relative flex flex-1 flex-col items-center justify-center px-6 pb-6 pt-2">
-      {/* Image frame */}
-      <div className="relative max-h-[calc(100vh-260px)] max-w-[min(1200px,calc(100vw-96px))] anim-fade">
-        {/* Edge glow overlays for the active direction */}
-        {activeDirection && (
-          <div
-            className={`pointer-events-none absolute inset-0 rounded-[var(--radius-lg)] edge-glow-${activeDirection}`}
-          />
-        )}
-
-        <div
-          className="relative overflow-hidden rounded-[var(--radius-lg)] checker"
-          style={{
-            border: '1px solid var(--border)',
-            boxShadow:
-              '0 1px 0 rgba(255,255,255,0.04) inset, 0 24px 48px -12px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.4)',
-          }}
-        >
-          <img
-            src={image}
-            alt=""
-            className="block max-h-[calc(100vh-260px)] max-w-[min(1200px,calc(100vw-96px))] object-contain anim-fade"
-            draggable={false}
-          />
-        </div>
-
-        {/* Edge handles — only when not displaying a result */}
-        {!isResult && (
-          <>
-            <EdgeHandle
-              direction="up"
-              onClick={onExtend}
-              active={activeDirection === 'up'}
-              disabled={loading}
-            />
-            <EdgeHandle
-              direction="down"
-              onClick={onExtend}
-              active={activeDirection === 'down'}
-              disabled={loading}
-            />
-            <EdgeHandle
-              direction="left"
-              onClick={onExtend}
-              active={activeDirection === 'left'}
-              disabled={loading}
-            />
-            <EdgeHandle
-              direction="right"
-              onClick={onExtend}
-              active={activeDirection === 'right'}
-              disabled={loading}
-            />
-          </>
-        )}
-      </div>
-
-      {/* Below-image meta row */}
-      <div className="mt-5 flex items-center gap-3 anim-slide-up">
-        {dimensions && (
-          <div
-            className="rounded-full border px-2.5 py-1 font-mono text-[11px]"
-            style={{
-              borderColor: 'var(--border)',
-              background: 'var(--bg-elev)',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            {dimensions.width} × {dimensions.height}
-          </div>
-        )}
-        {isResult && variantSelector}
-        {isResult && resultMessage && (
-          <StatusPill status="ok" message={resultMessage} />
-        )}
-        {!isResult && !loading && (
-          <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-            Click an edge to extend
-          </span>
-        )}
-        {loading && (
-          <StatusPill
-            status="working"
-            message={progressMessage || (activeDirection ? `Extending ${activeDirection}…` : 'Working…')}
-          />
-        )}
-      </div>
-
-      {isResult && resultActions && (
-        <div className="mt-4 anim-slide-up">{resultActions}</div>
-      )}
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Empty state — drop zone for upload + generate link
-// ─────────────────────────────────────────────────────────────────────────────
-
-function EmptyState({
-  onPickFile,
-  onGenerate,
-  onDropFile,
-}: {
-  onPickFile: () => void
-  onGenerate: () => void
-  onDropFile: (file: File) => void
-}) {
-  const [drag, setDrag] = useState(false)
-  return (
-    <div className="flex flex-1 items-center justify-center px-6 pb-8 pt-4">
-      <div className="w-full max-w-2xl anim-fade">
-        <div
-          onClick={onPickFile}
-          onDragOver={(e) => {
-            e.preventDefault()
-            setDrag(true)
-          }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={(e) => {
-            e.preventDefault()
-            setDrag(false)
-            const file = e.dataTransfer.files?.[0]
-            if (file && file.type.startsWith('image/')) onDropFile(file)
-          }}
-          className="group relative cursor-pointer rounded-[var(--radius-lg)] px-8 py-20 text-center transition-all"
-          style={{
-            border: `1.5px dashed ${
-              drag ? 'var(--accent)' : 'var(--border-strong)'
-            }`,
-            background: drag ? 'var(--accent-bg)' : 'var(--bg-elev)',
-          }}
-        >
-          <div
-            className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full transition-transform group-hover:scale-110"
-            style={{
-              background: 'var(--surface)',
-              border: '1px solid var(--border)',
-              color: 'var(--accent)',
-            }}
-          >
-            <Icons.Upload size={24} />
-          </div>
-          <p className="mb-1.5 text-[15px] font-medium" style={{ color: 'var(--text)' }}>
-            Drop an image to begin
-          </p>
-          <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
-            PNG, JPG, or WEBP — click anywhere in this area to browse
-          </p>
-        </div>
-
-        <div className="mt-5 flex items-center justify-center gap-2 text-[13px]">
-          <span style={{ color: 'var(--text-muted)' }}>or</span>
-          <button
-            onClick={onGenerate}
-            className="inline-flex items-center gap-1.5 font-medium transition-colors"
-            style={{ color: 'var(--accent)' }}
-          >
-            <Icons.Sparkle size={14} />
-            generate one with AI
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CommandBar — floating bottom bar with prompt + style picker
-// ─────────────────────────────────────────────────────────────────────────────
-
-function CommandBar({
-  prompt,
-  setPrompt,
-  artStyle,
-  setArtStyle,
-  loading,
-  hint,
-}: {
-  prompt: string
-  setPrompt: (v: string) => void
-  artStyle: string
-  setArtStyle: (v: string) => void
-  loading: boolean
-  hint?: string
-}) {
-  return (
-    <div className="relative z-10 flex justify-center px-4 pb-6 pt-2">
-      <div
-        className="anim-slide-up flex w-full max-w-3xl items-stretch gap-2 rounded-[var(--radius-lg)] p-1.5"
-        style={{
-          background: 'var(--bg-elev)',
-          border: '1px solid var(--border-strong)',
-          boxShadow: '0 12px 32px -12px rgba(0,0,0,0.6)',
-        }}
-      >
-        <input
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          disabled={loading}
-          placeholder={
-            hint ?? 'Optional: describe what should appear in the new area…'
-          }
-          className="flex-1 bg-transparent px-3 py-2.5 text-[14px] focus:outline-none"
-          style={{ color: 'var(--text)' }}
-        />
-
-        <div
-          className="hidden items-center sm:flex"
-          style={{ borderLeft: '1px solid var(--border)' }}
-        >
-          <select
-            value={artStyle}
-            onChange={(e) => setArtStyle(e.target.value)}
-            disabled={loading}
-            className="select-styled cursor-pointer border-0 bg-transparent py-2 pl-3 pr-7 text-[13px] focus:outline-none"
-            style={{ color: 'var(--text-secondary)' }}
-            title="Art style for the extension"
-          >
-            {ART_STYLE_GROUPS.map((group) =>
-              group.options.length === 1 && group.label === 'Match original' ? (
-                <option key={group.options[0].value} value={group.options[0].value}>
-                  {group.options[0].label}
-                </option>
-              ) : (
-                <optgroup key={group.label} label={group.label}>
-                  {group.options.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </optgroup>
-              )
-            )}
-          </select>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Variant selector — cycle between AI-generated extension candidates
-// ─────────────────────────────────────────────────────────────────────────────
-
-function VariantSelector({
-  index,
-  total,
-  isBest,
-  score,
-  onPrev,
-  onNext,
-}: {
-  index: number
-  total: number
-  /** True when the current variant is the algorithm-picked best blend. */
-  isBest: boolean
-  /** Optional raw seam score, only shown in debug mode. */
-  score?: number
-  onPrev: () => void
-  onNext: () => void
-}) {
-  return (
-    <div
-      className="inline-flex items-center gap-1 rounded-full border py-0.5 pl-1 pr-2 anim-fade"
-      style={{
-        borderColor: 'var(--border-strong)',
-        background: 'var(--bg-elev)',
-      }}
-      role="group"
-      aria-label="Cycle between extension variants"
-    >
-      <button
-        onClick={onPrev}
-        className="icon-btn h-6 w-6"
-        aria-label="Previous variant (←)"
-        title="Previous variant (←)"
-      >
-        <Icons.ArrowLeft size={13} />
-      </button>
-      <span
-        className="font-mono text-[11px] tabular-nums"
-        style={{ color: 'var(--text-secondary)' }}
-      >
-        Variant {index + 1}/{total}
-      </span>
-      {isBest && (
-        <span
-          className="rounded-full px-1.5 py-px text-[10px] font-medium tracking-wide"
-          style={{
-            background: 'var(--accent-bg)',
-            color: 'var(--accent)',
-            border: '1px solid var(--accent-border)',
-          }}
-          title="Algorithm's pick: lowest seam residual"
-        >
-          BEST
-        </span>
-      )}
-      {typeof score === 'number' && (
-        <span
-          className="font-mono text-[10px]"
-          style={{ color: 'var(--text-muted)' }}
-          title="Mean color difference at the seam — lower is better"
-        >
-          {score.toFixed(1)}
-        </span>
-      )}
-      <button
-        onClick={onNext}
-        className="icon-btn h-6 w-6"
-        aria-label="Next variant (→)"
-        title="Next variant (→)"
-      >
-        <Icons.ArrowRight size={13} />
-      </button>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Result actions — appears below the image when an extension is ready
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ResultActions({
-  onAccept,
-  onRegenerate,
-  onDiscard,
-  onDownload,
-  loading,
-}: {
-  onAccept: () => void
-  onRegenerate: () => void
-  onDiscard: () => void
-  onDownload: () => void
-  loading: boolean
-}) {
-  return (
-    <div
-      className="flex items-center gap-1.5 rounded-full border p-1"
-      style={{
-        background: 'var(--bg-elev)',
-        borderColor: 'var(--border-strong)',
-        boxShadow: '0 12px 32px -16px rgba(0,0,0,0.6)',
-      }}
-    >
-      <button
-        onClick={onDiscard}
-        disabled={loading}
-        className="btn btn-ghost"
-        title="Discard this extension"
-      >
-        <Icons.X size={14} />
-        Discard
-      </button>
-      <button
-        onClick={onRegenerate}
-        disabled={loading}
-        className="btn btn-ghost"
-        title="Generate a new variation"
-      >
-        {loading ? <Icons.Spinner size={14} /> : <Icons.Refresh size={14} />}
-        Regenerate
-      </button>
-      <button
-        onClick={onDownload}
-        disabled={loading}
-        className="btn btn-ghost"
-        title="Download as PNG"
-      >
-        <Icons.Download size={14} />
-        Download
-      </button>
-      <div
-        className="mx-1 h-5 w-px"
-        style={{ background: 'var(--border)' }}
-        aria-hidden
-      />
-      <button
-        onClick={onAccept}
-        disabled={loading}
-        className="btn btn-primary"
-        title="Use this as the new base image"
-      >
-        <Icons.Check size={14} />
-        Accept
-      </button>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Settings drawer — debug mode, generate-from-scratch entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
-function SettingsDrawer({
-  open,
-  onClose,
-  debugMode,
-  setDebugMode,
-  onGenerate,
-  apiKey,
-  onEditApiKey,
-  onClearApiKey,
-  selectedModel,
-  setSelectedModel,
-}: {
-  open: boolean
-  onClose: () => void
-  debugMode: boolean
-  setDebugMode: (v: boolean) => void
-  onGenerate: () => void
-  apiKey: string
-  onEditApiKey: () => void
-  onClearApiKey: () => void
-  selectedModel: string
-  setSelectedModel: (v: string) => void
-}) {
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
-
-  if (!open) return null
-  return (
-    <>
-      <div
-        className="fixed inset-0 z-30 anim-fade"
-        style={{ background: 'rgba(0,0,0,0.5)' }}
-        onClick={onClose}
-      />
-      <aside
-        className="fixed right-0 top-0 z-40 flex h-full w-[360px] flex-col anim-slide-up"
-        style={{
-          background: 'var(--bg-elev)',
-          borderLeft: '1px solid var(--border-strong)',
-        }}
-      >
-        <div
-          className="flex h-14 shrink-0 items-center justify-between border-b px-5"
-          style={{ borderColor: 'var(--border)' }}
-        >
-          <h2 className="text-[14px] font-semibold tracking-tight">Settings</h2>
-          <button onClick={onClose} className="icon-btn" aria-label="Close">
-            <Icons.X size={16} />
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5">
-          <Section title="Model">
-            <div className="space-y-2">
-              {MODELS.map((m) => {
-                const active = m.value === selectedModel
-                return (
-                  <button
-                    key={m.value}
-                    onClick={() => setSelectedModel(m.value)}
-                    className="flex w-full items-start gap-3 rounded-[var(--radius-sm)] p-3 text-left transition-colors"
-                    style={{
-                      background: active ? 'var(--accent-bg)' : 'var(--surface)',
-                      border: `1px solid ${active ? 'var(--accent-border)' : 'var(--border)'}`,
-                    }}
-                  >
-                    <div
-                      className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full"
-                      style={{
-                        border: `1.5px solid ${active ? 'var(--accent)' : 'var(--border-strong)'}`,
-                        background: active ? 'var(--accent)' : 'transparent',
-                      }}
-                    >
-                      {active && (
-                        <span
-                          className="h-1.5 w-1.5 rounded-full"
-                          style={{ background: '#1a1404' }}
-                        />
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[13px] font-medium">{m.label}</div>
-                      <div
-                        className="mt-0.5 truncate text-[11px]"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        {m.hint ? `${m.hint} · ` : ''}
-                        <code className="font-mono">{m.value}</code>
-                      </div>
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
-          </Section>
-
-          <Section title="OpenRouter key">
-            {apiKey ? (
-              <div
-                className="flex items-center gap-3 rounded-[var(--radius-sm)] p-3"
-                style={{
-                  background: 'var(--surface)',
-                  border: '1px solid var(--border)',
-                }}
-              >
-                <div
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded"
-                  style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
-                >
-                  <Icons.Key size={14} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[12px] font-medium">Key saved locally</div>
-                  <div
-                    className="truncate font-mono text-[11px]"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    {maskKey(apiKey)}
-                  </div>
-                </div>
-                <button
-                  onClick={onEditApiKey}
-                  className="icon-btn"
-                  aria-label="Edit key"
-                  title="Edit key"
-                >
-                  <Icons.Settings size={14} />
-                </button>
-                <button
-                  onClick={onClearApiKey}
-                  className="icon-btn"
-                  aria-label="Remove key"
-                  title="Remove key"
-                >
-                  <Icons.Trash size={14} />
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={onEditApiKey}
-                className="btn btn-secondary w-full justify-start"
-              >
-                <Icons.Key size={14} />
-                Add OpenRouter key
-              </button>
-            )}
-            <p className="mt-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              Stored only in this browser. Get one at{' '}
-              <a
-                href="https://openrouter.ai/keys"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: 'var(--accent)' }}
-              >
-                openrouter.ai/keys
-              </a>
-              .
-            </p>
-          </Section>
-
-          <Section title="Tools">
-            <button
-              onClick={() => {
-                onClose()
-                onGenerate()
-              }}
-              className="btn btn-secondary w-full justify-start"
-            >
-              <Icons.Sparkle size={15} />
-              Generate image from scratch
-            </button>
-            <p className="mt-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              Create a brand-new image from a text description, then extend it.
-            </p>
-          </Section>
-
-          <Section title="Developer">
-            <Toggle
-              label="Debug overlay"
-              description="Draw seam guides and log Poisson scores to the console."
-              checked={debugMode}
-              onChange={setDebugMode}
-            />
-          </Section>
-
-          <Section title="About">
-            <p
-              className="text-[12px] leading-relaxed"
-              style={{ color: 'var(--text-secondary)' }}
-            >
-              Extensions are 38% of the current image dimension. For larger
-              extensions, click an edge again after accepting.
-            </p>
-            <p
-              className="mt-3 text-[11px]"
-              style={{ color: 'var(--text-muted)' }}
-            >
-              Seamless blending via Poisson editing (Pérez et al. 2003).
-            </p>
-          </Section>
-        </div>
-      </aside>
-    </>
-  )
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="mb-6">
-      <h3
-        className="mb-3 text-[11px] font-medium uppercase tracking-wider"
-        style={{ color: 'var(--text-muted)' }}
-      >
-        {title}
-      </h3>
-      {children}
-    </div>
-  )
-}
-
-function Toggle({
-  label,
-  description,
-  checked,
-  onChange,
-}: {
-  label: string
-  description?: string
-  checked: boolean
-  onChange: (v: boolean) => void
-}) {
-  return (
-    <label className="flex cursor-pointer items-start justify-between gap-4 rounded-[var(--radius-sm)] py-1">
-      <div className="flex-1">
-        <div className="text-[13px] font-medium">{label}</div>
-        {description && (
-          <div
-            className="mt-0.5 text-[12px] leading-snug"
-            style={{ color: 'var(--text-muted)' }}
-          >
-            {description}
-          </div>
-        )}
-      </div>
-      <span
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className="relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
-        style={{
-          background: checked ? 'var(--accent)' : 'var(--surface)',
-          border: `1px solid ${checked ? 'var(--accent)' : 'var(--border-strong)'}`,
-        }}
-      >
-        <span
-          className="inline-block h-3 w-3 rounded-full transition-transform"
-          style={{
-            background: checked ? '#1a1404' : 'var(--text-secondary)',
-            transform: checked ? 'translateX(18px)' : 'translateX(3px)',
-          }}
-        />
-      </span>
-    </label>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Generate modal — text-to-image
-// ─────────────────────────────────────────────────────────────────────────────
-
-function GenerateModal({
-  open,
-  onClose,
-  prompt,
-  setPrompt,
-  width,
-  setWidth,
-  height,
-  setHeight,
-  artStyle,
-  setArtStyle,
-  generating,
-  onGenerate,
-}: {
-  open: boolean
-  onClose: () => void
-  prompt: string
-  setPrompt: (v: string) => void
-  width: number
-  setWidth: (v: number) => void
-  height: number
-  setHeight: (v: number) => void
-  artStyle: string
-  setArtStyle: (v: string) => void
-  generating: boolean
-  onGenerate: () => void
-}) {
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
-
-  if (!open) return null
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 anim-fade">
-      <div
-        className="absolute inset-0"
-        style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)' }}
-        onClick={onClose}
-      />
-      <div
-        className="anim-slide-up relative w-full max-w-lg rounded-[var(--radius-lg)] p-6"
-        style={{
-          background: 'var(--bg-elev)',
-          border: '1px solid var(--border-strong)',
-          boxShadow: '0 32px 64px -16px rgba(0,0,0,0.8)',
-        }}
-      >
-        <div className="mb-5 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div
-              className="flex h-7 w-7 items-center justify-center rounded-md"
-              style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
-            >
-              <Icons.Sparkle size={15} />
-            </div>
-            <h2 className="text-[15px] font-semibold tracking-tight">
-              Generate image
-            </h2>
-          </div>
-          <button onClick={onClose} className="icon-btn" aria-label="Close">
-            <Icons.X size={16} />
-          </button>
-        </div>
-
-        <div className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-[12px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-              Description
-            </label>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="e.g. A wide mountain valley at golden hour, with a winding river through pine forest"
-              rows={3}
-              className="field resize-none"
-              autoFocus
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1.5 block text-[12px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-                Width
-              </label>
-              <select
-                value={width}
-                onChange={(e) => setWidth(Number(e.target.value))}
-                className="field select-styled"
-              >
-                {[512, 768, 1024, 1280, 1536].map((v) => (
-                  <option key={v} value={v}>
-                    {v}px
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1.5 block text-[12px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-                Height
-              </label>
-              <select
-                value={height}
-                onChange={(e) => setHeight(Number(e.target.value))}
-                className="field select-styled"
-              >
-                {[512, 768, 1024, 1280, 1536].map((v) => (
-                  <option key={v} value={v}>
-                    {v}px
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          <div>
-            <label className="mb-1.5 block text-[12px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-              Style
-            </label>
-            <select
-              value={artStyle}
-              onChange={(e) => setArtStyle(e.target.value)}
-              className="field select-styled"
-            >
-              {ART_STYLE_GROUPS.map((group) =>
-                group.options.length === 1 && group.label === 'Match original' ? (
-                  <option key={group.options[0].value} value={group.options[0].value}>
-                    Photorealistic
-                  </option>
-                ) : (
-                  <optgroup key={group.label} label={group.label}>
-                    {group.options.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                )
-              )}
-            </select>
-          </div>
-        </div>
-
-        <div className="mt-6 flex items-center justify-end gap-2">
-          <button onClick={onClose} disabled={generating} className="btn btn-ghost">
-            Cancel
-          </button>
-          <button
-            onClick={onGenerate}
-            disabled={generating || !prompt.trim()}
-            className="btn btn-primary"
-          >
-            {generating ? <Icons.Spinner size={14} /> : <Icons.Sparkle size={14} />}
-            {generating ? 'Generating…' : 'Generate'}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// API key modal — first-run prompt to BYOK
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ApiKeyModal({
-  open,
-  initialValue,
-  required,
-  onSave,
-  onSkip,
-  onClose,
-}: {
-  open: boolean
-  initialValue: string
-  /** If true, the user can't dismiss without entering a key (no Skip / Esc). */
-  required: boolean
-  onSave: (key: string) => void
-  onSkip?: () => void
-  onClose: () => void
-}) {
-  const [value, setValue] = useState(initialValue)
-  const [reveal, setReveal] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    setValue(initialValue)
-    setTimeout(() => inputRef.current?.focus(), 50)
-  }, [open, initialValue])
-
-  useEffect(() => {
-    if (!open || required) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, required, onClose])
-
-  if (!open) return null
-
-  const trimmed = value.trim()
-  const looksValid = trimmed.startsWith('sk-or-') && trimmed.length > 20
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 anim-fade">
-      <div
-        className="absolute inset-0"
-        style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(6px)' }}
-        onClick={() => {
-          if (!required) onClose()
-        }}
-      />
-      <div
-        className="anim-slide-up relative w-full max-w-md rounded-[var(--radius-lg)] p-6"
-        style={{
-          background: 'var(--bg-elev)',
-          border: '1px solid var(--border-strong)',
-          boxShadow: '0 32px 64px -16px rgba(0,0,0,0.8)',
-        }}
-      >
-        <div className="mb-4 flex items-center gap-3">
-          <div
-            className="flex h-9 w-9 items-center justify-center rounded-md"
-            style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
-          >
-            <Icons.Key size={17} />
-          </div>
-          <div className="flex-1">
-            <h2 className="text-[15px] font-semibold tracking-tight">
-              {required ? 'Add your OpenRouter key' : 'OpenRouter API key'}
-            </h2>
-            <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              Required to generate or extend images.
-            </p>
-          </div>
-          {!required && (
-            <button onClick={onClose} className="icon-btn" aria-label="Close">
-              <Icons.X size={16} />
-            </button>
-          )}
-        </div>
-
-        <div className="mb-4">
-          <div className="relative">
-            <input
-              ref={inputRef}
-              type={reveal ? 'text' : 'password'}
-              autoComplete="off"
-              spellCheck={false}
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && looksValid) onSave(trimmed)
-              }}
-              placeholder="sk-or-..."
-              className="field pr-10 font-mono text-[13px]"
-            />
-            <button
-              type="button"
-              onClick={() => setReveal((r) => !r)}
-              className="icon-btn absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2"
-              aria-label={reveal ? 'Hide key' : 'Show key'}
-              tabIndex={-1}
-            >
-              {reveal ? <Icons.EyeOff size={14} /> : <Icons.Eye size={14} />}
-            </button>
-          </div>
-          {value && !looksValid && (
-            <div
-              className="mt-2 flex items-start gap-2 text-[12px]"
-              style={{ color: 'var(--danger)' }}
-            >
-              <Icons.AlertTriangle size={13} className="mt-0.5 shrink-0" />
-              <span>OpenRouter keys start with <code className="font-mono">sk-or-</code>.</span>
-            </div>
-          )}
-        </div>
-
-        <div
-          className="mb-4 rounded-[var(--radius-sm)] p-3 text-[12px] leading-relaxed"
-          style={{
-            background: 'var(--surface)',
-            border: '1px solid var(--border)',
-            color: 'var(--text-secondary)',
-          }}
-        >
-          Your key is stored only in this browser&apos;s <code className="font-mono">localStorage</code>.
-          It&apos;s sent with each request to your local server, which proxies it to OpenRouter — never logged, never persisted server-side.
-        </div>
-
-        <a
-          href="https://openrouter.ai/keys"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mb-5 inline-flex items-center gap-1.5 text-[12px] transition-colors"
-          style={{ color: 'var(--accent)' }}
-        >
-          Get a key at openrouter.ai/keys
-          <Icons.External size={11} />
-        </a>
-
-        <div className="flex items-center justify-between gap-2">
-          {!required && onSkip ? (
-            <button onClick={onSkip} className="btn btn-ghost">
-              Use server env
-            </button>
-          ) : (
-            <span />
-          )}
-          <button
-            onClick={() => onSave(trimmed)}
-            disabled={!looksValid}
-            className="btn btn-primary"
-          >
-            <Icons.Check size={14} />
-            Save key
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Error toast — slides in at the top, auto-dismisses
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ErrorToast({ message, onClose }: { message: string; onClose: () => void }) {
-  useEffect(() => {
-    const t = setTimeout(onClose, 6000)
-    return () => clearTimeout(t)
-  }, [onClose])
-  return (
-    <div
-      className="fixed left-1/2 top-4 z-50 -translate-x-1/2 anim-slide-down"
-      role="alert"
-    >
-      <div
-        className="flex items-start gap-3 rounded-[var(--radius)] px-4 py-3"
-        style={{
-          background: 'var(--bg-elev)',
-          border: '1px solid rgba(255, 107, 107, 0.35)',
-          boxShadow: '0 16px 40px -12px rgba(0,0,0,0.6)',
-          maxWidth: 480,
-        }}
-      >
-        <div className="mt-0.5" style={{ color: 'var(--danger)' }}>
-          <Icons.X size={16} />
-        </div>
-        <div className="flex-1 text-[13px]" style={{ color: 'var(--text)' }}>
-          {message}
-        </div>
-        <button onClick={onClose} className="icon-btn -m-1.5 h-7 w-7">
-          <Icons.X size={14} />
-        </button>
-      </div>
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main orchestrator
-// ─────────────────────────────────────────────────────────────────────────────
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { CommandBar } from '@/app/components/CommandBar'
+import { EmptyState } from '@/app/components/EmptyState'
+import { ApiKeyModal, ErrorToast, GenerateModal, SettingsDrawer, Toggle } from '@/app/components/Modals'
+import { ParallaxStudio } from '@/app/components/ParallaxStudio'
+import { PropStudio } from '@/app/components/PropStudio'
+import { SpriteStudio } from '@/app/components/SpriteStudio'
+import { TileStudio } from '@/app/components/TileStudio'
+import { TopBar } from '@/app/components/TopBar'
+import { ResultActions, VariantSelector } from '@/app/components/VariantSelector'
+import { Workspace } from '@/app/components/Workspace'
+import { Candidate, Direction, EXTENSION_PERCENT, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL } from '@/app/lib/app'
+import { findStyleLabel } from '@/app/lib/artStyles'
+import { DEFAULT_MODEL, MODELS, getModelConfig } from '@/app/lib/models'
+import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
+import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout } from '@/app/lib/props'
+import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
+import { CORNER_GRAFTS, ENABLE_CORNER_RECONCILE, TILESET_ATLAS_EXTRUDE_PX, TILESET_BY_ROLE, TILESET_COLS, TILESET_PADDED_SHEET_H, TILESET_PADDED_SHEET_W, TILESET_PADDED_STRIDE, TILESET_ROWS, TILESET_SHEET_H, TILESET_SHEET_W, TILESET_SLOTS, TILESET_TILE_SIZE, TILE_TEMPLATE_CELL, TILE_TEMPLATE_COLS, TILE_TEMPLATE_H, TILE_TEMPLATE_MASK, TILE_TEMPLATE_ROWS, TILE_TEMPLATE_SAMPLES, TILE_TEMPLATE_W, TileSetRole, TileSetSlot, alignAiOutputToTemplate, applyFeatheredRoleMask, buildTileSheetGuideDataUrl, createEmptyTileSet, rebuildCornerTile, reconcileAllCorners, templateRoleForCell } from '@/app/lib/tileset'
+import { alignSpriteFramesToBaseline, applyFullContextResult, centerSpriteFramesHorizontally, chromaKeyToAlpha, createChunkedExtension, createFullContextExtension, getImageDimensions, harmonizeHorizontalSeams, isAiExtensionUnfilled, makeHorizontallyTileable, makeTileable2D, makeVerticallyTileable, measureSeamResidual, removeFrameBorder, removeUploadedBackground, sliceImageGrid, stitchExtendedChunk } from '@/app/utils/imageProcessor'
+import { SubjectBounds, drawPoseGuideSheet, measureSubjectBounds } from '@/app/utils/poseRig'
+import JSZip from 'jszip'
 
 export default function Home() {
   // Image state
@@ -1564,6 +48,9 @@ export default function Home() {
     direction: Direction
     customPrompt: string
     artStyle: string
+    /** Parallax layer this extension was made on (sky/far/mid/near). Carried
+     * so regenerate replays the same role. */
+    layerRole?: LayerRole
   } | null>(null)
 
   // Operation state
@@ -1577,6 +64,114 @@ export default function Home() {
   const [customPrompt, setCustomPrompt] = useState('')
   const [artStyle, setArtStyle] = useState('none')
   const [debugMode, setDebugMode] = useState(false)
+
+  // Mode: which top-level tool the user is in. Persisted to localStorage so a
+  // game designer doesn't have to re-pick parallax every visit.
+  const [mode, setModeState] = useState<Mode>('extender')
+
+  // Parallax-specific state. Target width is the "auto-extend until we hit
+  // this width" goal; autoExtending tracks the loop; the stop ref lets the
+  // user interrupt mid-loop without React re-render races. The layers array
+  // holds the per-depth-band images that compose into a real parallax scene.
+  const [parallaxTargetWidth, setParallaxTargetWidth] = useState<number | null>(null)
+  const [parallaxAutoExtending, setParallaxAutoExtending] = useState(false)
+  const parallaxAutoStopRef = useRef(false)
+  const [parallaxLayers, setParallaxLayers] = useState<ParallaxLayer[]>(() =>
+    createDefaultLayers()
+  )
+  const [parallaxActiveIdx, setParallaxActiveIdx] = useState(() =>
+    LAYER_ORDER.indexOf(WORKFLOW_ORDER[0])
+  )
+  /** Shared art direction for all parallax layers — auto-derived from the
+   * first Near layer generation prompt, editable before Mid / Far / Sky.
+   * Also reused by Tile mode so generated material textures match the
+   * existing project palette/lighting/style. */
+  const [sceneBrief, setSceneBrief] = useState('')
+  const [sceneBriefLoading, setSceneBriefLoading] = useState(false)
+
+  // Tile-set state. A 13-slot autotile set for 2D platformer tile-maps:
+  // body + 4 edges + 4 outer corners + 4 inner corners. Each non-body tile
+  // is generated against magenta and chroma-keyed to alpha so the user can
+  // drop tiles over any background. Generated text-only with role-specific
+  // magenta-layout instructions; consistency comes from a shared prompt +
+  // sceneBrief across calls.
+  const [tileSet, setTileSet] = useState<TileSetSlot[]>(() => createEmptyTileSet())
+  const [tilePrompt, setTilePrompt] = useState('')
+  const [tileSetGenerating, setTileSetGenerating] = useState(false)
+  const [tileProgressMsg, setTileProgressMsg] = useState<string | null>(null)
+  const tileStopRef = useRef(false)
+
+  // Props / decoration state — a sheet of standalone transparent decoration
+  // sprites scattered on top of a tile map. Generated in one AI call (like the
+  // tile set) so the whole set shares a palette; sliced + chroma-keyed client
+  // side. Each prop can be re-rolled individually via a separate call.
+  const [propItems, setPropItems] = useState<PropItem[]>([])
+  const [propPrompt, setPropPrompt] = useState('')
+  const [propSetGenerating, setPropSetGenerating] = useState(false)
+  const [propProgressMsg, setPropProgressMsg] = useState<string | null>(null)
+  const propStopRef = useRef(false)
+
+  // Sprite-animation state. One sheet at a time (the active animation type).
+  // Switching animation chips creates a fresh empty sheet so each animation
+  // is independent; the previous sheet is replaced rather than archived.
+  //
+  // Frame consistency: we use a two-pass anchor → sheet workflow. Pass 1
+  // generates a single neutral standing reference of the character ("the
+  // anchor"); Pass 2 generates the 8-frame sheet and passes the anchor as
+  // a visual reference, which 2026's AI-sprite community identified as the
+  // strongest known technique for keeping the character on-model across
+  // cells (chongdashu/ai-game-spritesheets, Robotic Ape, Auto-Sprite, etc.).
+  // The anchor PERSISTS across animation switches so the same character can
+  // be re-used for idle/walk/run/jump/attack/hurt/death without re-rolling
+  // identity.
+  const [spriteAnim, setSpriteAnim] = useState<SpriteAnimType>('idle')
+  const [spriteSheet, setSpriteSheet] = useState<SpriteSheet>(() =>
+    createEmptySpriteSheet('idle')
+  )
+  // Per-animation cache so switching tabs doesn't discard generated sheets.
+  // Keyed by animation type; the latest sheet for each anim is kept here so
+  // the user can flip between idle/walk/run/… and still see prior results.
+  // Cleared when the character identity (anchor) changes, since cached sheets
+  // belong to the previous character.
+  const spriteSheetCacheRef = useRef<Partial<Record<SpriteAnimType, SpriteSheet>>>(
+    {}
+  )
+  // Set of animation types that currently have a generated (cached) sheet, used
+  // to mark those tabs with a dot so the user knows results are saved there.
+  const [spriteGeneratedAnims, setSpriteGeneratedAnims] = useState<
+    Set<SpriteAnimType>
+  >(new Set())
+  useEffect(() => {
+    spriteSheetCacheRef.current[spriteSheet.anim] = spriteSheet
+    const next = new Set<SpriteAnimType>()
+    for (const [anim, sheet] of Object.entries(spriteSheetCacheRef.current)) {
+      if (sheet && sheet.frames.some((f) => !!f.imageUrl)) {
+        next.add(anim as SpriteAnimType)
+      }
+    }
+    setSpriteGeneratedAnims(next)
+  }, [spriteSheet])
+  const [spriteAnchor, setSpriteAnchor] = useState<{
+    /** Chroma-keyed thumbnail (transparent background) for display. */
+    imageUrl: string
+    /** Raw magenta-background version — fed to the AI as a reference image
+     * on every sheet pass. The model sees magenta naturally, transparent
+     * regions less so, so we keep the un-keyed version for inference. */
+    rawImageUrl: string
+    /** Prompt that produced this anchor. */
+    prompt: string
+    /** True when the anchor came from a user-uploaded image rather than the
+     * anchor generation pass. Uploaded anchors are never auto-regenerated
+     * from the prompt. */
+    uploaded?: boolean
+  } | null>(null)
+  const [spritePrompt, setSpritePrompt] = useState('')
+  const [spriteFps, setSpriteFps] = useState<number>(
+    SPRITE_ANIMATIONS.idle.defaultFps
+  )
+  const [spriteGenerating, setSpriteGenerating] = useState(false)
+  const [spriteProgressMsg, setSpriteProgressMsg] = useState<string | null>(null)
+  const spriteStopRef = useRef(false)
 
   // Modal/drawer state
   const [showGenerateModal, setShowGenerateModal] = useState(false)
@@ -1603,9 +198,19 @@ export default function Home() {
     try {
       const k = localStorage.getItem(STORAGE_KEY) || ''
       const m = localStorage.getItem(STORAGE_MODEL) || ''
+      const savedMode = localStorage.getItem(STORAGE_MODE) || ''
       setApiKey(k)
       if (m && MODELS.some((mm) => mm.value === m)) {
         setSelectedModel(m)
+      }
+      if (
+        savedMode === 'parallax' ||
+        savedMode === 'extender' ||
+        savedMode === 'tile' ||
+        savedMode === 'sprite' ||
+        savedMode === 'props'
+      ) {
+        setModeState(savedMode)
       }
       if (!k) {
         setApiKeyRequired(true)
@@ -1618,6 +223,14 @@ export default function Home() {
     } finally {
       setHydrated(true)
     }
+  }, [])
+
+  /** Persist mode + reset parallax-specific transient state on change. */
+  const setMode = useCallback((next: Mode) => {
+    setModeState(next)
+    try {
+      localStorage.setItem(STORAGE_MODE, next)
+    } catch {}
   }, [])
 
   // Persist key + model changes.
@@ -1667,6 +280,139 @@ export default function Home() {
     return true
   }
 
+  // ── Parallax layer helpers ─────────────────────────────────────────────────
+
+  /** Convenience accessor for the currently-edited parallax layer. */
+  const activeLayer: ParallaxLayer | null =
+    mode === 'parallax' ? parallaxLayers[parallaxActiveIdx] ?? null : null
+
+  /**
+   * Update a single field on the currently-active layer. Used by the layer
+   * panel sliders and by image-loading paths that need to write back the
+   * generated/extended image plus its dimensions.
+   */
+  const patchActiveLayer = useCallback(
+    (patch: Partial<ParallaxLayer>) => {
+      setParallaxLayers((prev) =>
+        prev.map((l, i) => (i === parallaxActiveIdx ? { ...l, ...patch } : l))
+      )
+    },
+    [parallaxActiveIdx]
+  )
+
+  const setLayerScrollSpeed = useCallback((idx: number, speed: number) => {
+    setParallaxLayers((prev) =>
+      prev.map((l, i) =>
+        i === idx ? { ...l, scrollSpeed: Math.max(0, speed) } : l
+      )
+    )
+  }, [])
+
+  const clearLayer = useCallback((idx: number) => {
+    setParallaxLayers((prev) =>
+      prev.map((l, i) =>
+        i === idx
+          ? {
+              ...l,
+              imageUrl: null,
+              rawImageUrl: null,
+              width: null,
+              height: null,
+              fromUpload: false,
+            }
+          : l
+      )
+    )
+  }, [])
+
+  /**
+   * Apply a freshly-loaded image (from upload or generation) to the active
+   * layer. Sky layers are stored as-is; non-sky layers are chroma-keyed for
+   * display while the raw is preserved for future extension. Uploads are
+   * trusted to already have correct alpha and bypass the keying pass.
+   */
+  const applyImageToActiveLayer = useCallback(
+    async (imageUrl: string, options: { fromUpload: boolean }) => {
+      const layer = parallaxLayers[parallaxActiveIdx]
+      if (!layer) return
+      const isKeyed = !LAYER_ROLES[layer.role].isOpaque
+      const dims = await getImageDimensions(imageUrl)
+      let displayImage = imageUrl
+      let rawImage: string | null = imageUrl
+      if (isKeyed && !options.fromUpload) {
+        // Keyed layers from generation/extension: apply chroma key for
+        // display, keep the raw for re-feeding into the extend pipeline.
+        displayImage = await chromaKeyToAlpha(imageUrl)
+        rawImage = imageUrl
+      } else if (isKeyed && options.fromUpload) {
+        // User-supplied alpha — trust it. raw == display.
+        rawImage = imageUrl
+      }
+      patchActiveLayer({
+        imageUrl: displayImage,
+        rawImageUrl: rawImage,
+        width: dims.width,
+        height: dims.height,
+        fromUpload: options.fromUpload,
+      })
+      // Nudge workflow: after filling a layer, jump to the next empty one
+      // in front→back order so users naturally build Near → Mid → Far → Sky.
+      const updatedLayers = parallaxLayers.map((l, i) =>
+        i === parallaxActiveIdx
+          ? {
+              ...l,
+              imageUrl: displayImage,
+              rawImageUrl: rawImage,
+              width: dims.width,
+              height: dims.height,
+              fromUpload: options.fromUpload,
+            }
+          : l
+      )
+      const nextIdx = getRecommendedLayerIndex(updatedLayers)
+      if (nextIdx !== null && nextIdx !== parallaxActiveIdx) {
+        setParallaxActiveIdx(nextIdx)
+      }
+    },
+    [parallaxLayers, parallaxActiveIdx, patchActiveLayer]
+  )
+
+  // Mirror the active parallax layer's dimensions into the legacy
+  // currentImageDimensions state used by the extend pipeline guard. We have
+  // to depend on the dims directly (not just `parallaxActiveIdx`) so the
+  // sync re-fires when generation/extension fills in dims for a previously-
+  // empty layer — otherwise the guard would still see a null and throw
+  // "Image dimensions not available yet."
+  const activeLayerWidth =
+    mode === 'parallax' ? parallaxLayers[parallaxActiveIdx]?.width ?? null : null
+  const activeLayerHeight =
+    mode === 'parallax' ? parallaxLayers[parallaxActiveIdx]?.height ?? null : null
+  useEffect(() => {
+    if (mode !== 'parallax') return
+    if (activeLayerWidth && activeLayerHeight) {
+      setCurrentImageDimensions({
+        width: activeLayerWidth,
+        height: activeLayerHeight,
+      })
+    } else {
+      setCurrentImageDimensions(null)
+    }
+  }, [mode, activeLayerWidth, activeLayerHeight])
+
+  // Switching to a different layer should wipe in-flight review state —
+  // otherwise a stale candidate from layer N would render over layer M's
+  // canvas. This is intentionally separate from the dim-sync effect above so
+  // it only fires on actual layer switches, not on every layer mutation.
+  useEffect(() => {
+    if (mode !== 'parallax') return
+    setExtendedCandidates([])
+    setCandidateDims([])
+    setSelectedCandidateIdx(0)
+    setImageBeforeExtension(null)
+    setLastExtensionParams(null)
+    setActiveDirection(null)
+  }, [mode, parallaxActiveIdx])
+
   // ── Image loaders ──────────────────────────────────────────────────────────
 
   const loadDataUrlAsImage = useCallback(
@@ -1711,13 +457,40 @@ export default function Home() {
   const handleFile = useCallback(
     (file: File) => {
       const reader = new FileReader()
-      reader.onload = (e) => {
+      reader.onload = async (e) => {
         const dataUrl = e.target?.result as string
-        loadDataUrlAsImage(dataUrl, file.name)
+        if (mode === 'parallax') {
+          // Parallax uploads target the active layer, not the global image.
+          // We trust user-supplied alpha (PNG with transparency works as-is).
+          try {
+            await applyImageToActiveLayer(dataUrl, { fromUpload: true })
+            setOriginalFileName(file.name)
+            setError(null)
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to load image')
+          }
+        } else if (mode === 'tile') {
+          // Tile-set mode is generate-only — uploads aren't supported because
+          // each tile has a strict role + magenta layout that an arbitrary
+          // upload can't match. Surface a clear hint instead of silently
+          // ignoring the dropped file.
+          setError(
+            'Tile-set mode generates from prompts only. Switch to Extender mode to outpaint an uploaded image.'
+          )
+        } else if (mode === 'sprite') {
+          // Sprite mode is also generate-only — animation sheets need
+          // strict 4×2 keyframe staging on a magenta key that an arbitrary
+          // upload can't match.
+          setError(
+            'Sprite mode generates from prompts only. Switch to Extender mode to outpaint an uploaded image.'
+          )
+        } else {
+          loadDataUrlAsImage(dataUrl, file.name)
+        }
       }
       reader.readAsDataURL(file)
     },
-    [loadDataUrlAsImage]
+    [mode, applyImageToActiveLayer, loadDataUrlAsImage]
   )
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1726,6 +499,38 @@ export default function Home() {
   }
 
   // ── Generate from scratch ──────────────────────────────────────────────────
+
+  const deriveSceneBrief = useCallback(
+    async (anchorPrompt: string) => {
+      if (!anchorPrompt.trim()) return
+      setSceneBriefLoading(true)
+      try {
+        const response = await fetch('/api/scene-brief', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            anchorPrompt: anchorPrompt.trim(),
+            artStyle: artStyle !== 'none' ? artStyle : undefined,
+            apiKey: apiKey || undefined,
+            model: selectedModel,
+          }),
+        })
+        const data = await response.json()
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to derive scene direction')
+        }
+        if (typeof data.sceneBrief === 'string' && data.sceneBrief.trim()) {
+          setSceneBrief(data.sceneBrief.trim())
+        }
+      } catch (err) {
+        // Non-fatal — user can type the brief manually.
+        console.warn('Scene brief derivation failed:', err)
+      } finally {
+        setSceneBriefLoading(false)
+      }
+    },
+    [apiKey, artStyle, selectedModel]
+  )
 
   const handleGenerateImage = async () => {
     if (!generatePrompt.trim()) {
@@ -1736,6 +541,8 @@ export default function Home() {
     setGenerating(true)
     setError(null)
     try {
+      const layerRole =
+        mode === 'parallax' ? activeLayer?.role : undefined
       const response = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1746,6 +553,14 @@ export default function Home() {
           artStyle: artStyle !== 'none' ? artStyle : undefined,
           apiKey: apiKey || undefined,
           model: selectedModel,
+          layerRole,
+          sceneBrief:
+            mode === 'parallax' &&
+            layerRole &&
+            layerRole !== WORKFLOW_ORDER[0] &&
+            sceneBrief.trim()
+              ? sceneBrief.trim()
+              : undefined,
         }),
       })
       const data = await response.json()
@@ -1757,7 +572,17 @@ export default function Home() {
         throw new Error(data.error || 'Failed to generate image')
       }
       if (!data.imageUrl) throw new Error('No image returned from API')
-      loadDataUrlAsImage(data.imageUrl, 'generated.png')
+      const anchorPromptUsed = generatePrompt.trim()
+      if (mode === 'parallax') {
+        // Route into the active layer (with chroma-keying for non-sky roles).
+        await applyImageToActiveLayer(data.imageUrl, { fromUpload: false })
+        setOriginalFileName(`parallax_${activeLayer?.role ?? 'layer'}.png`)
+        if (layerRole === WORKFLOW_ORDER[0] && anchorPromptUsed) {
+          void deriveSceneBrief(anchorPromptUsed)
+        }
+      } else {
+        loadDataUrlAsImage(data.imageUrl, 'generated.png')
+      }
       setShowGenerateModal(false)
       setGeneratePrompt('')
     } catch (err) {
@@ -1774,11 +599,21 @@ export default function Home() {
       direction: Direction,
       sourceImage: string,
       promptText: string,
-      style: string
+      style: string,
+      /**
+       * Parallax layer role hint. When provided and non-sky, the API call
+       * passes the role so the model keeps the magenta key intact, and we
+       * apply chroma-keying to the blended result before storing it as the
+       * displayable candidate image. The pre-keying source is preserved on
+       * the candidate so the next extend can feed magenta back to the model.
+       */
+      layerRole?: LayerRole
     ) => {
       if (!currentImageDimensions) {
         throw new Error('Image dimensions not available yet.')
       }
+
+      const isKeyedLayer = !!layerRole && layerRole !== 'sky'
 
       const callExtendApi = async (
         expandedCanvas: string,
@@ -1795,6 +630,11 @@ export default function Home() {
             artStyle: style !== 'none' ? style : undefined,
             apiKey: apiKey || undefined,
             model: selectedModel,
+            layerRole,
+            sceneBrief:
+              mode === 'parallax' && sceneBrief.trim()
+                ? sceneBrief.trim()
+                : undefined,
             ...body,
           }),
         })
@@ -1805,6 +645,20 @@ export default function Home() {
           throw err
         }
         return data.imageUrl as string
+      }
+
+      /** Convert a raw blended image into a displayable candidate, applying
+       * chroma-key alpha for keyed parallax layers. */
+      const finalizeCandidate = async (
+        blended: string,
+        score: number,
+        attempt: number
+      ): Promise<Candidate> => {
+        if (isKeyedLayer) {
+          const keyed = await chromaKeyToAlpha(blended)
+          return { imageUrl: keyed, rawImageUrl: blended, score, attempt }
+        }
+        return { imageUrl: blended, score, attempt }
       }
 
       const isHorizontal = direction === 'left' || direction === 'right'
@@ -1859,7 +713,7 @@ export default function Home() {
                 `🔬 Variant ${attempt + 1} seam residual: ${score.toFixed(2)}`
               )
             }
-            candidates.push({ imageUrl: blended, score, attempt: attempt + 1 })
+            candidates.push(await finalizeCandidate(blended, score, attempt + 1))
           } finally {
             clearInterval(tickHandle)
           }
@@ -1900,25 +754,49 @@ export default function Home() {
         }
       }
     },
-    [currentImageDimensions, debugMode, apiKey, selectedModel]
+    [currentImageDimensions, debugMode, apiKey, selectedModel, mode, sceneBrief]
   )
 
+  /**
+   * Resolve which image (and which layer role, if any) the next extension
+   * should operate on. In parallax mode the source is the active layer's
+   * raw (un-keyed) image so the AI sees the magenta key consistently; in
+   * extender mode it's just the global selectedImage.
+   */
+  const resolveExtendSource = (): {
+    sourceImage: string | null
+    layerRole?: LayerRole
+  } => {
+    if (mode === 'parallax') {
+      const layer = activeLayer
+      if (!layer || !layer.imageUrl) return { sourceImage: null }
+      return {
+        sourceImage: layer.rawImageUrl ?? layer.imageUrl,
+        layerRole: layer.role,
+      }
+    }
+    return { sourceImage: selectedImage }
+  }
+
   const handleExtend = async (direction: Direction) => {
-    if (!selectedImage || loading) return
+    if (loading) return
     if (!ensureCanGenerate()) return
+    const { sourceImage, layerRole } = resolveExtendSource()
+    if (!sourceImage) return
     setError(null)
     setLoading(true)
     setProgressMsg(`Extending ${direction}…`)
     setActiveDirection(direction)
-    setImageBeforeExtension(selectedImage)
-    setLastExtensionParams({ direction, customPrompt, artStyle })
+    setImageBeforeExtension(sourceImage)
+    setLastExtensionParams({ direction, customPrompt, artStyle, layerRole })
 
     try {
       const candidates = await runExtend(
         direction,
-        selectedImage,
+        sourceImage,
         customPrompt,
-        artStyle
+        artStyle,
+        layerRole
       )
       adoptCandidates(candidates)
     } catch (err) {
@@ -1946,7 +824,8 @@ export default function Home() {
         lastExtensionParams.direction,
         imageBeforeExtension,
         lastExtensionParams.customPrompt,
-        lastExtensionParams.artStyle
+        lastExtensionParams.artStyle,
+        lastExtensionParams.layerRole
       )
       adoptCandidates(candidates)
     } catch (err) {
@@ -1979,12 +858,25 @@ export default function Home() {
   const handleAccept = () => {
     if (!activeCandidate) return
     const accepted = activeCandidate.imageUrl
-    setSelectedImage(accepted)
-    const img = new Image()
-    img.onload = () => {
-      setCurrentImageDimensions({ width: img.width, height: img.height })
+
+    if (mode === 'parallax' && activeLayer) {
+      // In parallax mode, accept writes back to the active layer (display +
+      // raw + dims) rather than touching the global selectedImage.
+      const dims = candidateDims[selectedCandidateIdx]
+      patchActiveLayer({
+        imageUrl: accepted,
+        rawImageUrl: activeCandidate.rawImageUrl ?? accepted,
+        width: dims?.width ?? activeLayer.width,
+        height: dims?.height ?? activeLayer.height,
+      })
+    } else {
+      setSelectedImage(accepted)
+      const img = new Image()
+      img.onload = () => {
+        setCurrentImageDimensions({ width: img.width, height: img.height })
+      }
+      img.src = accepted
     }
-    img.src = accepted
     setExtendedCandidates([])
     setCandidateDims([])
     setSelectedCandidateIdx(0)
@@ -2029,7 +921,2680 @@ export default function Home() {
     setActiveDirection(null)
     setError(null)
     setCustomPrompt('')
+    setParallaxTargetWidth(null)
+    // Parallax: blow away every populated layer when the user picks "New".
+    if (mode === 'parallax') {
+      setParallaxLayers(createDefaultLayers())
+      setParallaxActiveIdx(LAYER_ORDER.indexOf(WORKFLOW_ORDER[0]))
+      setSceneBrief('')
+      setSceneBriefLoading(false)
+    }
+    // Tile-set: clear all 13 tiles + prompt; sceneBrief stays so the user
+    // can keep iterating sets within the same project.
+    if (mode === 'tile') {
+      setTileSet(createEmptyTileSet())
+      setTilePrompt('')
+      setTileProgressMsg(null)
+      tileStopRef.current = false
+    }
+    // Props: clear all decoration sprites + prompt; sceneBrief stays so the
+    // props can keep matching the rest of the project.
+    if (mode === 'props') {
+      setPropItems([])
+      setPropPrompt('')
+      setPropProgressMsg(null)
+      propStopRef.current = false
+    }
+    // Sprite: wipe frames + prompt + anchor; sceneBrief is kept so the
+    // user can keep iterating sprites within the same project / scene.
+    if (mode === 'sprite') {
+      setSpriteSheet(createEmptySpriteSheet(spriteAnim))
+      setSpriteAnchor(null)
+      setSpritePrompt('')
+      setSpriteFps(SPRITE_ANIMATIONS[spriteAnim].defaultFps)
+      setSpriteProgressMsg(null)
+      spriteStopRef.current = false
+    }
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  // ── Tile-set mode handlers ───────────────────────────────────────────────
+
+  /** Mutate a single tile slot in the set. */
+  const patchTileSlot = (
+    role: TileSetRole,
+    patch: Partial<TileSetSlot>
+  ) => {
+    setTileSet((prev) =>
+      prev.map((s) => (s.role === role ? { ...s, ...patch } : s))
+    )
+  }
+
+  /** Apply role-appropriate post-processing: magenta→alpha for non-body
+   * tiles, plus tileability passes only along the role's loop axis.
+   *
+   * Tile-mode uses an AGGRESSIVE chroma-key tuning (low cast threshold,
+   * wide softness) because the AI tends to render the cut boundaries as
+   * faint pink lines at the 25% mark inside cells. The default tuning is
+   * conservative enough to preserve parallax-layer art that contains warm
+   * reds; tile materials (stone, dirt, brick, ice, etc.) have effectively
+   * zero natural magenta cast, so we can crank the threshold down without
+   * eating real material colors. This kills the "thin pink stripe between
+   * material and transparency" artefact at its source. */
+  const TILE_CHROMA_KEY_OPTS = {
+    castThreshold: 40,
+    castSoftness: 35,
+    despill: 1,
+    despillGreenBoost: 0.6,
+  }
+  const enforceTileRoleMask = async (
+    role: TileSetRole,
+    imageUrl: string
+  ): Promise<string> => {
+    if (role === 'body') return imageUrl
+
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      img.crossOrigin = 'anonymous'
+      img.onload = () => {
+        const w = img.width
+        const h = img.height
+        const qx = Math.round(w / 4)
+        const qy = Math.round(h / 4)
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          reject(new Error('Failed to get tile mask canvas context'))
+          return
+        }
+
+        ctx.drawImage(img, 0, 0, w, h)
+        const imageData = ctx.getImageData(0, 0, w, h)
+        applyFeatheredRoleMask(imageData.data, w, h, role, qx, qy)
+        ctx.putImageData(imageData, 0, 0)
+        resolve(canvas.toDataURL('image/png'))
+      }
+      img.onerror = () => reject(new Error('Failed to load tile for mask enforcement'))
+      img.src = imageUrl
+    })
+  }
+  const postProcessTile = async (
+    role: TileSetRole,
+    rawImageUrl: string
+  ): Promise<string> => {
+    if (role === 'body') {
+      // Body cell is fully opaque (no magenta should be there at all), but
+      // the AI sometimes leaks faint pink lines at the cell boundaries that
+      // get sliced into this cell. We run the chroma-key in DESPILL-ONLY
+      // mode (cast threshold above 255 = nothing ever becomes transparent)
+      // to neutralize any pinkish pixels back to neutral material color
+      // before the 2D-tileable pass.
+      const despilled = await chromaKeyToAlpha(rawImageUrl, {
+        castThreshold: 256,
+        castSoftness: 0,
+        despill: 1,
+        despillGreenBoost: 0.6,
+      })
+      // Body is repeated many times in the preview, so tiny edge errors and
+      // left/right tonal drift become obvious grid lines. Use a stronger pass
+      // than parallax/background tiling: wide blends hide the loop boundary,
+      // and full equalization removes the "panel" look from a single repeated
+      // dirt/stone cell while preserving local pebbles/roots.
+      return makeTileable2D(despilled, {
+        equalizeStrength: 1,
+        blendWidthPx: Math.round(TILESET_TILE_SIZE * 0.22),
+        verticalBlendHeightPx: Math.round(TILESET_TILE_SIZE * 0.22),
+      })
+    }
+    if (role === 'top' || role === 'bottom') {
+      // Edge tiles loop only along their non-cut axis. We harden the loop
+      // axis BEFORE alpha-keying so the algorithm sees full opaque pixels.
+      const tiled = await makeHorizontallyTileable(rawImageUrl)
+      const keyed = await chromaKeyToAlpha(tiled, TILE_CHROMA_KEY_OPTS)
+      return enforceTileRoleMask(role, keyed)
+    }
+    if (role === 'left' || role === 'right') {
+      const tiled = await makeVerticallyTileable(rawImageUrl)
+      const keyed = await chromaKeyToAlpha(tiled, TILE_CHROMA_KEY_OPTS)
+      return enforceTileRoleMask(role, keyed)
+    }
+    // Corner tiles — no axis loops, just key the magenta to alpha.
+    const keyed = await chromaKeyToAlpha(rawImageUrl, TILE_CHROMA_KEY_OPTS)
+    return enforceTileRoleMask(role, keyed)
+  }
+
+  /** Generate a single tile slot. Returns the resolved image URL (already
+   * post-processed) so callers can chain or assign as needed. Throws on
+   * failure so the caller can surface error state. */
+  const generateOneTile = async (role: TileSetRole): Promise<string> => {
+    const slot = TILESET_BY_ROLE[role]
+    const labelLower = slot.label.toLowerCase()
+    setTileProgressMsg(`Generating ${labelLower}…`)
+    patchTileSlot(role, { generating: true })
+
+    try {
+      const tileGuideImage = buildTileSheetGuideDataUrl()
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: tilePrompt,
+          width: TILESET_TILE_SIZE,
+          height: TILESET_TILE_SIZE,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          tileMode: true,
+          tileRole: role,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        if (response.status === 401) {
+          setApiKeyRequired(true)
+          setShowApiKeyModal(true)
+        }
+        throw new Error(data.error || `Failed to generate ${labelLower} tile`)
+      }
+      if (!data.imageUrl) throw new Error('No image returned from API')
+
+      setTileProgressMsg(`Processing ${labelLower}…`)
+      const processed = await postProcessTile(role, data.imageUrl)
+
+      // Keep corners reconciled with their edge neighbors after a single
+      // regen (the generate-all path reconciles the whole set at once). We
+      // read neighbor URLs from current state.
+      const neighborUrls: Partial<Record<TileSetRole, string>> = {}
+      tileSet.forEach((s) => {
+        if (s.imageUrl && s.role !== role) neighborUrls[s.role] = s.imageUrl
+      })
+
+      const isCorner = !!CORNER_GRAFTS[role]
+      if (ENABLE_CORNER_RECONCILE && isCorner) {
+        // A corner was regenerated → rebuild it against current neighbors
+        // (inner corners are assembled from neighbors; outer corners grafted).
+        let finalUrl = processed
+        try {
+          finalUrl = await rebuildCornerTile(role, processed, neighborUrls)
+        } catch {
+          /* fall back to the raw corner */
+        }
+        patchTileSlot(role, {
+          imageUrl: finalUrl,
+          hasImage: true,
+          generating: false,
+        })
+        return finalUrl
+      }
+
+      patchTileSlot(role, {
+        imageUrl: processed,
+        hasImage: true,
+        generating: false,
+      })
+
+      // An edge/body was regenerated → rebuild every corner so their shared
+      // borders (and assembled inner corners) track the new tile.
+      const affectsCorners =
+        role === 'top' ||
+        role === 'bottom' ||
+        role === 'left' ||
+        role === 'right' ||
+        role === 'body'
+      if (affectsCorners && ENABLE_CORNER_RECONCILE) {
+        const updatedNeighbors = { ...neighborUrls, [role]: processed }
+        await Promise.all(
+          (Object.keys(CORNER_GRAFTS) as TileSetRole[]).map(async (cRole) => {
+            const cUrl = tileSet.find((s) => s.role === cRole)?.imageUrl
+            if (!cUrl) return
+            try {
+              const rebuilt = await rebuildCornerTile(
+                cRole,
+                cUrl,
+                updatedNeighbors
+              )
+              patchTileSlot(cRole, { imageUrl: rebuilt })
+            } catch {
+              /* leave the corner as-is on failure */
+            }
+          })
+        )
+      }
+
+      return processed
+    } catch (err) {
+      patchTileSlot(role, { generating: false })
+      throw err
+    }
+  }
+
+  /** Generate the full 13-tile set in ONE AI call as a 4×4 sprite-sheet,
+   * then slice + post-process each cell. This is the consistency win: all
+   * tiles come out of the same diffusion pass so palette, texture detail,
+   * and lighting are locked across the set. The per-tile path (used by
+   * `handleRegenerateTile`) is retained as an escape hatch for individual
+   * failures. */
+  /** Composite the generated tiles into the platform-preview mockup (the same
+   * layout PlatformPreview renders) on a sky backdrop, and return it as a data
+   * URL. This is the image the QA art director inspects for seams / cohesion —
+   * problems show up where tiles meet, not in isolated cells. */
+  const buildTilePreviewCompositeDataUrl = async (
+    map: Partial<Record<TileSetRole, string>>
+  ): Promise<string | null> => {
+    const rows = TILE_TEMPLATE_ROWS
+    const cols = TILE_TEMPLATE_COLS
+    const CELL = 96
+    const canvas = document.createElement('canvas')
+    canvas.width = cols * CELL
+    canvas.height = rows * CELL
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    const g = ctx.createLinearGradient(0, 0, 0, canvas.height)
+    g.addColorStop(0, '#8cc3eb')
+    g.addColorStop(1, '#28466e')
+    ctx.fillStyle = g
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+
+    const need = new Map<TileSetRole, string>()
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const role = templateRoleForCell(x, y)
+        if (role && map[role]) need.set(role, map[role] as string)
+      }
+    }
+    const imgByRole = new Map<TileSetRole, HTMLImageElement>()
+    await Promise.all(
+      Array.from(need.entries()).map(
+        ([role, src]) =>
+          new Promise<void>((resolve) => {
+            const img = new Image()
+            img.onload = () => {
+              imgByRole.set(role, img)
+              resolve()
+            }
+            img.onerror = () => resolve()
+            img.src = src
+          })
+      )
+    )
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const role = templateRoleForCell(x, y)
+        if (!role) continue
+        const img = imgByRole.get(role)
+        if (img) ctx.drawImage(img, x * CELL, y * CELL, CELL, CELL)
+      }
+    }
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Raw tile sheet built directly from a role→url map (state-independent, so
+   * the QA call can run before React state has committed). */
+  const buildSheetFromMapDataUrl = async (
+    map: Partial<Record<TileSetRole, string>>
+  ): Promise<string | null> => {
+    const entries = TILESET_SLOTS.filter((s) => map[s.role])
+    if (entries.length === 0) return null
+    const canvas = document.createElement('canvas')
+    canvas.width = TILESET_SHEET_W
+    canvas.height = TILESET_SHEET_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.imageSmoothingEnabled = false
+    await Promise.all(
+      entries.map(
+        (spec) =>
+          new Promise<void>((resolve) => {
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(
+                img,
+                spec.col * TILESET_TILE_SIZE,
+                spec.row * TILESET_TILE_SIZE,
+                TILESET_TILE_SIZE,
+                TILESET_TILE_SIZE
+              )
+              resolve()
+            }
+            img.onerror = () => resolve()
+            img.src = map[spec.role] as string
+          })
+      )
+    )
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Review half of the reverse pipeline — hand the assembled preview + sheet
+   * to the QA art director. Returns null (≈ approve) on any failure so a flaky
+   * critic never blocks the user. */
+  const fetchTileReview = async (
+    previewImage: string,
+    sheetImage: string | null
+  ): Promise<{ ok: boolean; issues: string[]; fix: string } | null> => {
+    try {
+      const res = await fetch('/api/tile-review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: tilePrompt,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          apiKey: apiKey || undefined,
+          previewImage,
+          sheetImage: sheetImage || undefined,
+        }),
+      })
+      if (!res.ok) return null
+      const data = await res.json()
+      if (typeof data?.ok !== 'boolean') return null
+      return data
+    } catch {
+      return null
+    }
+  }
+
+  const handleGenerateTileSet = async () => {
+    if (tileSetGenerating) return
+    if (!tilePrompt.trim()) {
+      setError('Describe the material you want — e.g. mossy stone floor.')
+      return
+    }
+    if (!ensureCanGenerate()) return
+    setError(null)
+    tileStopRef.current = false
+    setTileSetGenerating(true)
+    const startedAt = Date.now()
+    // Up to this many extra repaint passes after the first generation, each
+    // driven by the QA art director's fix report.
+    const MAX_TILE_REVIEW_PASSES = 2
+
+    // Mark every slot as "generating" up front so the UI shows the whole
+    // set spinning during the single AI call (vs. one cell at a time).
+    setTileSet((prev) => prev.map((s) => ({ ...s, generating: true })))
+
+    // Tick a live elapsed-seconds counter so the user sees progress during
+    // the long single call (sheet generation typically takes 30-90s).
+    let phase = 'Generating sheet'
+    const tickHandle = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      setTileProgressMsg(`${phase} · ${elapsed}s`)
+    }, 1000)
+
+    // One full generate → align → slice → process → reconcile pass. Returns
+    // the reconciled role→url map, or null if stopped. `fixNotes` carries the
+    // QA report into the regeneration prompt on retry passes.
+    const renderSheetOnce = async (
+      fixNotes?: string
+    ): Promise<Partial<Record<TileSetRole, string>> | null> => {
+      const tileGuideImage = buildTileSheetGuideDataUrl()
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: tilePrompt,
+          width: TILE_TEMPLATE_W,
+          height: TILE_TEMPLATE_H,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          tileSheet: true,
+          tileGuideImage,
+          tileFixNotes: fixNotes,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        if (response.status === 401) {
+          setApiKeyRequired(true)
+          setShowApiKeyModal(true)
+        }
+        throw new Error(data.error || 'Failed to generate tile sheet')
+      }
+      if (!data.imageUrl) throw new Error('No image returned from API')
+      if (tileStopRef.current) return null
+
+      phase = 'Aligning to template'
+      const aligned = await alignAiOutputToTemplate(data.imageUrl)
+      if (tileStopRef.current) return null
+
+      phase = 'Slicing template'
+      const cells = await sliceImageGrid(aligned, {
+        cols: TILE_TEMPLATE_COLS,
+        rows: TILE_TEMPLATE_ROWS,
+        cellSize: TILE_TEMPLATE_CELL,
+      })
+      if (tileStopRef.current) return null
+
+      phase = 'Processing tiles'
+      const processed = await Promise.all(
+        TILESET_SLOTS.map(async (spec) => {
+          const sample = TILE_TEMPLATE_SAMPLES[spec.role]
+          const cellIdx = sample.row * TILE_TEMPLATE_COLS + sample.col
+          const raw = cells[cellIdx]
+          if (!raw) return { role: spec.role, imageUrl: null }
+          try {
+            const out = await postProcessTile(spec.role, raw)
+            return { role: spec.role, imageUrl: out }
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn(`Post-process failed for ${spec.role}:`, err)
+            return { role: spec.role, imageUrl: raw }
+          }
+        })
+      )
+
+      phase = 'Reconciling corners'
+      const byRoleUrl: Partial<Record<TileSetRole, string>> = {}
+      processed.forEach((p) => {
+        if (p.imageUrl) byRoleUrl[p.role] = p.imageUrl
+      })
+      let reconciled = byRoleUrl
+      try {
+        reconciled = await reconcileAllCorners(byRoleUrl)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('Corner reconcile failed; using raw corners:', err)
+      }
+      return reconciled
+    }
+
+    // `reviewing` keeps each populated cell's spinner overlay on while the art
+    // director inspects the result (so the sheet visibly shows "still working"
+    // during review / repaint), then clears it once the verdict is final.
+    const applyMap = (
+      map: Partial<Record<TileSetRole, string>>,
+      reviewing: boolean
+    ) =>
+      setTileSet((prev) =>
+        prev.map((slot) => {
+          const url = map[slot.role] ?? null
+          return {
+            role: slot.role,
+            imageUrl: url,
+            hasImage: !!url,
+            generating: reviewing && !!url,
+          }
+        })
+      )
+
+    try {
+      let fixNotes: string | undefined
+      // Track the BEST candidate across passes and commit that one at the end —
+      // never just the last pass. A repaint fully re-rolls every flat tile (and
+      // the corners are composited deterministically afterwards), so a critic
+      // that rejects a clean first generation can otherwise replace it with a
+      // drifted, uglier sheet. Keep-best makes the review loop strictly safe:
+      // it can only ever improve on, never regress, the first generation.
+      // score: -1 = critic approved (best possible); otherwise the number of
+      // issues raised (fewer = better). Strictly-better comparison means TIES
+      // keep the EARLIER pass — and the first, un-nudged generation is the one
+      // least likely to have drifted.
+      let best: {
+        map: Partial<Record<TileSetRole, string>>
+        score: number
+      } | null = null
+
+      for (let pass = 0; pass <= MAX_TILE_REVIEW_PASSES; pass++) {
+        phase = pass === 0 ? 'Generating sheet' : `Repainting (pass ${pass + 1})`
+        const reconciled = await renderSheetOnce(fixNotes)
+        if (tileStopRef.current || !reconciled) return
+
+        // Show the attempt but KEEP each tile's spinner on to signal that the
+        // art director is still reviewing the sheet.
+        applyMap(reconciled, true)
+
+        phase = 'Art director reviewing'
+        setTileProgressMsg('Art director reviewing…')
+        const [previewImage, sheetImage] = await Promise.all([
+          buildTilePreviewCompositeDataUrl(reconciled),
+          buildSheetFromMapDataUrl(reconciled),
+        ])
+        if (tileStopRef.current) return
+
+        // No preview → can't review; treat as a neutral candidate.
+        const review = previewImage
+          ? await fetchTileReview(previewImage, sheetImage)
+          : null
+        if (tileStopRef.current) return
+
+        // null (critic unavailable/parse error) is treated as approved so a
+        // flaky critic never blocks the user.
+        const approved = !review || review.ok
+        const score = approved ? -1 : review.issues?.length || 1
+        if (!best || score < best.score) best = { map: reconciled, score }
+
+        if (approved) {
+          if (debugMode && review) {
+            // eslint-disable-next-line no-console
+            console.log('🧱 QA approved the tileset')
+          }
+          break
+        }
+
+        // Rejected — stop if there's nothing actionable or we're out of budget;
+        // otherwise carry the fix report into the next repaint.
+        fixNotes = review.fix || review.issues.join('; ')
+        if (!fixNotes || pass === MAX_TILE_REVIEW_PASSES) break
+
+        if (debugMode) {
+          // eslint-disable-next-line no-console
+          console.log('🧱 QA rejected, repainting with notes:', fixNotes)
+        }
+        // Leave the spinners on — they now signal the repaint in progress.
+        setTileProgressMsg('Issues found — repainting…')
+      }
+
+      // Commit the best candidate we saw (spinners off) — preferring the best,
+      // not the last, is what stops the review loop from turning a clean first
+      // generation into one with corner artifacts.
+      if (best) applyMap(best.map, false)
+    } catch (err) {
+      // Wipe the "generating" flags on failure so the UI stops spinning.
+      setTileSet((prev) => prev.map((s) => ({ ...s, generating: false })))
+      setError(
+        err instanceof Error ? err.message : 'Failed to generate tile sheet'
+      )
+    } finally {
+      clearInterval(tickHandle)
+      setTileSetGenerating(false)
+      setTileProgressMsg(null)
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      // eslint-disable-next-line no-console
+      if (debugMode) console.log(`🧱 Tile-set generated in ${elapsed}s`)
+    }
+  }
+
+  const handleStopTileSet = () => {
+    tileStopRef.current = true
+  }
+
+  /** Regenerate a single tile in the set without touching the others. */
+  const handleRegenerateTile = async (role: TileSetRole) => {
+    if (tileSetGenerating) return
+    if (!tilePrompt.trim()) {
+      setError('Describe the material you want before regenerating tiles.')
+      return
+    }
+    if (!ensureCanGenerate()) return
+    setError(null)
+    setTileSetGenerating(true)
+    try {
+      await generateOneTile(role)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to regenerate tile')
+    } finally {
+      setTileSetGenerating(false)
+      setTileProgressMsg(null)
+    }
+  }
+
+  const handleClearTileSet = () => {
+    setTileSet(createEmptyTileSet())
+    setTilePrompt('')
+    setTileProgressMsg(null)
+    tileStopRef.current = false
+    setError(null)
+  }
+
+  /** Render the 4x4 sprite-sheet PNG (4096x4096) by drawing each populated
+   * tile into its grid cell. Empty cells stay transparent. */
+  const buildTileSheetDataUrl = async (): Promise<string | null> => {
+    const populated = tileSet.filter((s) => s.imageUrl)
+    if (populated.length === 0) return null
+
+    const canvas = document.createElement('canvas')
+    canvas.width = TILESET_SHEET_W
+    canvas.height = TILESET_SHEET_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.imageSmoothingEnabled = false
+
+    await Promise.all(
+      populated.map(
+        (slot) =>
+          new Promise<void>((resolve, reject) => {
+            if (!slot.imageUrl) {
+              resolve()
+              return
+            }
+            const spec = TILESET_BY_ROLE[slot.role]
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(
+                img,
+                spec.col * TILESET_TILE_SIZE,
+                spec.row * TILESET_TILE_SIZE,
+                TILESET_TILE_SIZE,
+                TILESET_TILE_SIZE
+              )
+              resolve()
+            }
+            img.onerror = () => reject(new Error(`Failed to load ${spec.role}`))
+            img.src = slot.imageUrl
+          })
+      )
+    )
+
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Render an engine atlas with a 2px duplicated border around each tile.
+   * Importers should use the inner 512x512 region for each tile and leave
+   * the extruded pixels as atlas padding. */
+  const buildPaddedTileSheetDataUrl = async (): Promise<string | null> => {
+    const populated = tileSet.filter((s) => s.imageUrl)
+    if (populated.length === 0) return null
+
+    const canvas = document.createElement('canvas')
+    canvas.width = TILESET_PADDED_SHEET_W
+    canvas.height = TILESET_PADDED_SHEET_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.imageSmoothingEnabled = false
+
+    await Promise.all(
+      populated.map(
+        (slot) =>
+          new Promise<void>((resolve, reject) => {
+            if (!slot.imageUrl) {
+              resolve()
+              return
+            }
+            const spec = TILESET_BY_ROLE[slot.role]
+            const img = new Image()
+            img.onload = () => {
+              const x = spec.col * TILESET_PADDED_STRIDE
+              const y = spec.row * TILESET_PADDED_STRIDE
+              const p = TILESET_ATLAS_EXTRUDE_PX
+
+              ctx.drawImage(img, x + p, y + p, TILESET_TILE_SIZE, TILESET_TILE_SIZE)
+
+              // Edges.
+              ctx.drawImage(img, 0, 0, TILESET_TILE_SIZE, 1, x + p, y, TILESET_TILE_SIZE, p)
+              ctx.drawImage(img, 0, TILESET_TILE_SIZE - 1, TILESET_TILE_SIZE, 1, x + p, y + p + TILESET_TILE_SIZE, TILESET_TILE_SIZE, p)
+              ctx.drawImage(img, 0, 0, 1, TILESET_TILE_SIZE, x, y + p, p, TILESET_TILE_SIZE)
+              ctx.drawImage(img, TILESET_TILE_SIZE - 1, 0, 1, TILESET_TILE_SIZE, x + p + TILESET_TILE_SIZE, y + p, p, TILESET_TILE_SIZE)
+
+              // Corners.
+              ctx.drawImage(img, 0, 0, 1, 1, x, y, p, p)
+              ctx.drawImage(img, TILESET_TILE_SIZE - 1, 0, 1, 1, x + p + TILESET_TILE_SIZE, y, p, p)
+              ctx.drawImage(img, 0, TILESET_TILE_SIZE - 1, 1, 1, x, y + p + TILESET_TILE_SIZE, p, p)
+              ctx.drawImage(img, TILESET_TILE_SIZE - 1, TILESET_TILE_SIZE - 1, 1, 1, x + p + TILESET_TILE_SIZE, y + p + TILESET_TILE_SIZE, p, p)
+
+              resolve()
+            }
+            img.onerror = () => reject(new Error(`Failed to load ${spec.role}`))
+            img.src = slot.imageUrl
+          })
+      )
+    )
+
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Build the engine-friendly manifest describing every tile's grid cell
+   * and role. Engine importers (Phaser, Tiled, Godot, custom) can map cell
+   * coords → role with this. */
+  const buildTileSetManifest = () => ({
+    version: 1,
+    tileSize: TILESET_TILE_SIZE,
+    cols: TILESET_COLS,
+    rows: TILESET_ROWS,
+    sheetWidth: TILESET_SHEET_W,
+    sheetHeight: TILESET_SHEET_H,
+    productionAtlas: {
+      fileName: 'sheet_padded.png',
+      tileSize: TILESET_TILE_SIZE,
+      extrudePx: TILESET_ATLAS_EXTRUDE_PX,
+      stride: TILESET_PADDED_STRIDE,
+      sheetWidth: TILESET_PADDED_SHEET_W,
+      sheetHeight: TILESET_PADDED_SHEET_H,
+      importNote:
+        'Use each tile source rect at paddedX/paddedY with width/height tileSize. Keep the surrounding extruded pixels in the atlas to prevent filtering seams.',
+    },
+    prompt: tilePrompt,
+    sceneBrief: sceneBrief.trim() || null,
+    artStyle: artStyle !== 'none' ? artStyle : null,
+    tiles: TILESET_SLOTS.map((spec) => {
+      const slot = tileSet.find((s) => s.role === spec.role)
+      return {
+        role: spec.role,
+        label: spec.label,
+        col: spec.col,
+        row: spec.row,
+        index: spec.row * TILESET_COLS + spec.col,
+        fileName: `${spec.fileName}.png`,
+        present: !!slot?.imageUrl,
+        sourceX: spec.col * TILESET_TILE_SIZE,
+        sourceY: spec.row * TILESET_TILE_SIZE,
+        paddedX:
+          spec.col * TILESET_PADDED_STRIDE + TILESET_ATLAS_EXTRUDE_PX,
+        paddedY:
+          spec.row * TILESET_PADDED_STRIDE + TILESET_ATLAS_EXTRUDE_PX,
+      }
+    }),
+  })
+
+  const handleDownloadTileSheet = async () => {
+    try {
+      const sheet = await buildTileSheetDataUrl()
+      if (!sheet) {
+        setError('Generate at least one tile before downloading the sheet.')
+        return
+      }
+      const baseName = (tilePrompt.trim().slice(0, 24) || 'tileset').replace(
+        /[^a-z0-9]+/gi,
+        '_'
+      )
+      const link = document.createElement('a')
+      link.href = sheet
+      link.download = `${baseName}_sheet_${TILESET_SHEET_W}x${TILESET_SHEET_H}.png`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+
+      const paddedSheet = await buildPaddedTileSheetDataUrl()
+      if (paddedSheet) {
+        const linkPadded = document.createElement('a')
+        linkPadded.href = paddedSheet
+        linkPadded.download = `${baseName}_sheet_padded_${TILESET_PADDED_SHEET_W}x${TILESET_PADDED_SHEET_H}.png`
+        document.body.appendChild(linkPadded)
+        linkPadded.click()
+        document.body.removeChild(linkPadded)
+      }
+
+      // Also offer the manifest as a sidecar JSON in a second click.
+      const manifest = buildTileSetManifest()
+      const json = JSON.stringify(manifest, null, 2)
+      const jsonUrl = URL.createObjectURL(
+        new Blob([json], { type: 'application/json' })
+      )
+      const linkJson = document.createElement('a')
+      linkJson.href = jsonUrl
+      linkJson.download = `${baseName}_manifest.json`
+      document.body.appendChild(linkJson)
+      linkJson.click()
+      document.body.removeChild(linkJson)
+      URL.revokeObjectURL(jsonUrl)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export sheet')
+    }
+  }
+
+  const handleDownloadTileSetZip = async () => {
+    try {
+      const populated = tileSet.filter((s) => s.imageUrl)
+      if (populated.length === 0) {
+        setError('Generate at least one tile before exporting the ZIP.')
+        return
+      }
+      const zip = new JSZip()
+      // Drop each tile in as its own PNG.
+      for (const slot of populated) {
+        if (!slot.imageUrl) continue
+        const spec = TILESET_BY_ROLE[slot.role]
+        const base64 = slot.imageUrl.split(',')[1]
+        if (base64) {
+          zip.file(`${spec.fileName}.png`, base64, { base64: true })
+        }
+      }
+      // Combined sheet for engine import.
+      const sheet = await buildTileSheetDataUrl()
+      if (sheet) {
+        const base64 = sheet.split(',')[1]
+        if (base64) {
+          zip.file('sheet.png', base64, { base64: true })
+        }
+      }
+      const paddedSheet = await buildPaddedTileSheetDataUrl()
+      if (paddedSheet) {
+        const base64 = paddedSheet.split(',')[1]
+        if (base64) {
+          zip.file('sheet_padded.png', base64, { base64: true })
+        }
+      }
+      // Manifest with grid layout.
+      zip.file(
+        'manifest.json',
+        JSON.stringify(buildTileSetManifest(), null, 2)
+      )
+
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const baseName = (tilePrompt.trim().slice(0, 24) || 'tileset').replace(
+        /[^a-z0-9]+/gi,
+        '_'
+      )
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${baseName}_tileset.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export ZIP')
+    }
+  }
+
+  // ── Props / decoration mode handlers ──────────────────────────────────────
+  //
+  // Open-ended library: each "add more" press paints a fresh batch of
+  // PROP_BATCH decorations in one AI call and APPENDS them — existing props are
+  // never regenerated. To keep the growing library coherent, every batch (and
+  // every single re-roll) is given the current props as a style reference so
+  // palette / lighting stay locked while the model invents new decorations.
+
+  // Props are colorful (flowers, crystals, mushrooms), so we use a moderate
+  // chroma-key rather than the aggressive tile tuning — enough to delete the
+  // flat magenta cleanly without eating saturated prop colors. removeFrameBorder
+  // then wipes any neighbor bleed that crept into a cell's outer band.
+  const PROP_CHROMA_KEY_OPTS = {
+    castThreshold: 70,
+    castSoftness: 30,
+    despill: 1,
+    despillGreenBoost: 0.5,
+  }
+
+  /** Magenta → alpha for one sliced prop cell, then trim cell-edge bleed. */
+  const postProcessProp = async (rawCellUrl: string): Promise<string> => {
+    const keyed = await chromaKeyToAlpha(rawCellUrl, PROP_CHROMA_KEY_OPTS)
+    try {
+      return await removeFrameBorder(keyed)
+    } catch {
+      return keyed
+    }
+  }
+
+  /** Compose a REPRESENTATIVE sample of the existing library onto a magenta
+   * grid as a STYLE REFERENCE for the next batch — the model matches its
+   * palette/lighting but must paint decorations of DIFFERENT kinds. We sample
+   * evenly across the WHOLE library (not just the recent batch) so the model
+   * can see everything already made and avoid re-painting earlier categories.
+   * Drawn on magenta (the key color) so the model reads them in the same
+   * convention it must output. Returns undefined if empty. */
+  const buildPropStyleRefDataUrl = async (
+    items: PropItem[]
+  ): Promise<string | undefined> => {
+    const all = items.filter((p) => p.imageUrl)
+    if (all.length === 0) return undefined
+    // This image is a small STYLE ANCHOR — its only job is to lock palette /
+    // lighting / rendering, which text can't convey. De-duplication is handled
+    // separately by a cheap TEXT name list (see propAvoidHint), so we keep this
+    // tiny and FIXED-SIZE: a 3-col swatch of up to 9 props sampled evenly across
+    // the whole library, regardless of how big the library grows.
+    const CAP = 9
+    let withImg: PropItem[]
+    if (all.length <= CAP) {
+      withImg = all
+    } else {
+      withImg = []
+      for (let i = 0; i < CAP; i++) {
+        withImg.push(all[Math.floor((i * all.length) / CAP)])
+      }
+    }
+    const cell = 200
+    const cols = Math.min(3, withImg.length)
+    const rows = Math.ceil(withImg.length / cols)
+    const canvas = document.createElement('canvas')
+    canvas.width = cols * cell
+    canvas.height = rows * cell
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return undefined
+    ctx.fillStyle = '#FF00FF'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+    await Promise.all(
+      withImg.map(
+        (p, i) =>
+          new Promise<void>((resolve) => {
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(img, (i % cols) * cell, Math.floor(i / cols) * cell, cell, cell)
+              resolve()
+            }
+            img.onerror = () => resolve()
+            img.src = p.imageUrl as string
+          })
+      )
+    )
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Unique decoration categories already in the library (lowercase). Sent to
+   * the art director as the "do not repeat" set. */
+  const propCategoriesOf = (items: PropItem[]): string[] => {
+    const seen = new Set<string>()
+    for (const p of items) {
+      const n = (p.name || '').trim().toLowerCase()
+      if (n) seen.add(n)
+    }
+    return Array.from(seen)
+  }
+
+  /** CALL #1 of the props pipeline — ask the art-director text model for the
+   * next `count` fresh decoration ideas, given everything already made. Returns
+   * [] on any failure so callers fall back to free image-model invention. */
+  const fetchPropIdeas = async (
+    count: number,
+    items: PropItem[]
+  ): Promise<{ category: string; description: string }[]> => {
+    try {
+      const res = await fetch('/api/prop-brief', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: propPrompt,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          count,
+          existing: propCategoriesOf(items),
+        }),
+      })
+      if (!res.ok) return []
+      const data = await res.json()
+      return Array.isArray(data.ideas) ? data.ideas : []
+    } catch {
+      return []
+    }
+  }
+
+  /** Pack the whole library into one transparent atlas (PROP_ATLAS_COLS wide). */
+  const buildPropAtlasDataUrl = async (): Promise<string | null> => {
+    const populated = propItems.filter((p) => p.imageUrl)
+    if (populated.length === 0) return null
+    const layout = propAtlasLayout(populated.length)
+    const canvas = document.createElement('canvas')
+    canvas.width = layout.width
+    canvas.height = layout.height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.clearRect(0, 0, layout.width, layout.height)
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'high'
+    await Promise.all(
+      populated.map(
+        (p, i) =>
+          new Promise<void>((resolve) => {
+            const r = layout.rect(i)
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(img, r.x, r.y, r.width, r.height)
+              resolve()
+            }
+            img.onerror = () => resolve()
+            img.src = p.imageUrl as string
+          })
+      )
+    )
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Engine-friendly manifest describing the packed atlas + per-prop rects. */
+  const buildPropManifest = () => {
+    const populated = propItems.filter((p) => p.imageUrl)
+    const layout = propAtlasLayout(populated.length)
+    return {
+      type: 'prop-atlas',
+      generator: 'AI Image Extender — Props',
+      prompt: propPrompt.trim() || null,
+      sceneBrief: sceneBrief.trim() || null,
+      sheet: { width: layout.width, height: layout.height },
+      grid: { cols: layout.cols, rows: layout.rows, cellSize: PROP_TILE_SIZE },
+      count: populated.length,
+      props: populated.map((p, i) => {
+        const r = layout.rect(i)
+        return {
+          id: p.id,
+          file: `prop_${String(i + 1).padStart(3, '0')}.png`,
+          x: r.x,
+          y: r.y,
+          width: r.width,
+          height: r.height,
+        }
+      }),
+    }
+  }
+
+  /** Generate one batch of PROP_BATCH decorations and append them. Used for the
+   * first batch AND every "add more" — the model freely invents the items. */
+  const handleAddPropBatch = async () => {
+    if (propSetGenerating) return
+    if (!propPrompt.trim()) {
+      setError('Describe the biome / palette — e.g. lush forest decorations.')
+      return
+    }
+    if (!ensureCanGenerate()) return
+    setError(null)
+    propStopRef.current = false
+    setPropSetGenerating(true)
+    const startedAt = Date.now()
+
+    // Snapshot existing props for the style reference, then drop in BATCH
+    // spinner placeholders so the user sees the new cells filling in.
+    const existing = propItems.filter((p) => p.imageUrl)
+    const batchIds = Array.from({ length: PROP_BATCH }, () => nextPropId())
+    const batchIdSet = new Set(batchIds)
+    setPropItems((prev) => [
+      ...prev,
+      ...batchIds.map((id) => ({ id, imageUrl: null, generating: true })),
+    ])
+
+    const tickHandle = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      setPropProgressMsg(
+        `${existing.length ? 'Adding' : 'Generating'} ${PROP_BATCH} props · ${elapsed}s`
+      )
+    }, 1000)
+
+    const dropBatch = () =>
+      setPropItems((prev) => prev.filter((p) => !batchIdSet.has(p.id)))
+
+    try {
+      const refImage = await buildPropStyleRefDataUrl(existing)
+
+      // CALL #1 — ART DIRECTOR. A text model decides what NEW props to make,
+      // given the biome + every category already in the library. This is what
+      // keeps the set from looping the same lanterns/nests/pots — a reasoning
+      // model deliberately reaches for fresh kinds. Failure is non-fatal: we
+      // fall back to letting the image model free-invent.
+      setPropProgressMsg('Art director planning…')
+      const ideas = await fetchPropIdeas(PROP_BATCH, existing)
+      const briefs = ideas.map((i) => i.description)
+      const cats = ideas.map((i) => i.category)
+
+      // CALL #2 — RENDER. The image model paints exactly the art director's
+      // list, matched to the style anchor.
+      setPropProgressMsg(
+        `${existing.length ? 'Adding' : 'Generating'} ${PROP_BATCH} props · 0s`
+      )
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: propPrompt,
+          width: PROP_BATCH_W,
+          height: PROP_BATCH_H,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          propSheet: true,
+          propCols: PROP_BATCH_COLS,
+          propRows: PROP_BATCH_ROWS,
+          propCount: PROP_BATCH,
+          propRefImage: refImage,
+          propList: briefs.length ? briefs : undefined,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        if (response.status === 401) {
+          setApiKeyRequired(true)
+          setShowApiKeyModal(true)
+        }
+        throw new Error(data.error || 'Failed to generate props')
+      }
+      if (!data.imageUrl) throw new Error('No image returned from API')
+      if (propStopRef.current) {
+        dropBatch()
+        return
+      }
+
+      setPropProgressMsg('Slicing…')
+      const cells = await sliceImageGrid(data.imageUrl, {
+        cols: PROP_BATCH_COLS,
+        rows: PROP_BATCH_ROWS,
+        cellSize: PROP_TILE_SIZE,
+      })
+      if (propStopRef.current) {
+        dropBatch()
+        return
+      }
+
+      setPropProgressMsg('Processing…')
+      const processed = await Promise.all(
+        batchIds.map(async (_id, i) => {
+          const raw = cells[i]
+          if (!raw) return null
+          try {
+            return await postProcessProp(raw)
+          } catch {
+            return raw
+          }
+        })
+      )
+      if (propStopRef.current) {
+        dropBatch()
+        return
+      }
+
+      // Fill placeholders with their result; drop any cell that came back empty.
+      // The art director's category list lines up with the cells in reading
+      // order, so we tag each prop with the kind the director chose.
+      const urlById = new Map<string, string>()
+      const nameById = new Map<string, string>()
+      batchIds.forEach((id, i) => {
+        const url = processed[i]
+        if (url) {
+          urlById.set(id, url)
+          if (cats[i]) nameById.set(id, cats[i])
+        }
+      })
+      setPropItems((prev) =>
+        prev
+          .map((p) =>
+            batchIdSet.has(p.id)
+              ? {
+                  ...p,
+                  imageUrl: urlById.get(p.id) ?? null,
+                  name: nameById.get(p.id),
+                  generating: false,
+                }
+              : p
+          )
+          .filter((p) => !(batchIdSet.has(p.id) && !p.imageUrl))
+      )
+    } catch (err) {
+      dropBatch()
+      setError(err instanceof Error ? err.message : 'Failed to generate props')
+    } finally {
+      clearInterval(tickHandle)
+      setPropSetGenerating(false)
+      setPropProgressMsg(null)
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      // eslint-disable-next-line no-console
+      if (debugMode) console.log(`🌿 Prop batch generated in ${elapsed}s`)
+    }
+  }
+
+  const handleStopPropSet = () => {
+    propStopRef.current = true
+  }
+
+  /** Re-roll a single prop in place — a new decoration matched to the rest of
+   * the library's style (the other props are passed as a reference). */
+  const handleRegenerateProp = async (id: string) => {
+    if (propSetGenerating) return
+    if (!propPrompt.trim()) {
+      setError('Describe the biome first, then re-roll an individual prop.')
+      return
+    }
+    if (!ensureCanGenerate()) return
+    setError(null)
+    setPropItems((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, generating: true } : p))
+    )
+    setPropProgressMsg('Re-rolling prop…')
+    try {
+      const others = propItems.filter((p) => p.id !== id && p.imageUrl)
+      const refImage = await buildPropStyleRefDataUrl(others)
+      // Art director picks ONE fresh kind that isn't already in the library.
+      const ideas = await fetchPropIdeas(1, others)
+      const idea = ideas[0]
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: propPrompt,
+          width: PROP_TILE_SIZE,
+          height: PROP_TILE_SIZE,
+          artStyle: artStyle !== 'none' ? artStyle : undefined,
+          apiKey: apiKey || undefined,
+          model: selectedModel,
+          propMode: true,
+          propRole: idea?.description,
+          propRefImage: refImage,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        if (response.status === 401) {
+          setApiKeyRequired(true)
+          setShowApiKeyModal(true)
+        }
+        throw new Error(data.error || 'Failed to re-roll prop')
+      }
+      if (!data.imageUrl) throw new Error('No image returned from API')
+      setPropProgressMsg('Processing…')
+      const processed = await postProcessProp(data.imageUrl)
+      setPropItems((prev) =>
+        prev.map((p) =>
+          p.id === id
+            ? { ...p, imageUrl: processed, name: idea?.category, generating: false }
+            : p
+        )
+      )
+    } catch (err) {
+      setPropItems((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, generating: false } : p))
+      )
+      setError(err instanceof Error ? err.message : 'Failed to re-roll prop')
+    } finally {
+      setPropProgressMsg(null)
+    }
+  }
+
+  /** Remove a single prop from the library (curation). */
+  const handleDeleteProp = (id: string) => {
+    setPropItems((prev) => prev.filter((p) => p.id !== id))
+  }
+
+  const handleClearPropSet = () => {
+    setPropItems([])
+    setPropProgressMsg(null)
+    propStopRef.current = false
+  }
+
+  const handleDownloadPropSheet = async () => {
+    try {
+      const sheet = await buildPropAtlasDataUrl()
+      if (!sheet) {
+        setError('Generate at least one prop before downloading the atlas.')
+        return
+      }
+      const baseName = (propPrompt.trim().slice(0, 24) || 'props').replace(
+        /[^a-z0-9]+/gi,
+        '_'
+      )
+      const link = document.createElement('a')
+      link.href = sheet
+      link.download = `${baseName}_props_atlas.png`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+
+      const json = JSON.stringify(buildPropManifest(), null, 2)
+      const jsonUrl = URL.createObjectURL(
+        new Blob([json], { type: 'application/json' })
+      )
+      const linkJson = document.createElement('a')
+      linkJson.href = jsonUrl
+      linkJson.download = `${baseName}_props_manifest.json`
+      document.body.appendChild(linkJson)
+      linkJson.click()
+      document.body.removeChild(linkJson)
+      URL.revokeObjectURL(jsonUrl)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export atlas')
+    }
+  }
+
+  const handleDownloadPropZip = async () => {
+    try {
+      const populated = propItems.filter((p) => p.imageUrl)
+      if (populated.length === 0) {
+        setError('Generate at least one prop before exporting the ZIP.')
+        return
+      }
+      const zip = new JSZip()
+      populated.forEach((p, i) => {
+        const base64 = (p.imageUrl as string).split(',')[1]
+        if (base64) {
+          zip.file(`prop_${String(i + 1).padStart(3, '0')}.png`, base64, {
+            base64: true,
+          })
+        }
+      })
+      const sheet = await buildPropAtlasDataUrl()
+      if (sheet) {
+        const base64 = sheet.split(',')[1]
+        if (base64) zip.file('props_atlas.png', base64, { base64: true })
+      }
+      zip.file('manifest.json', JSON.stringify(buildPropManifest(), null, 2))
+
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const baseName = (propPrompt.trim().slice(0, 24) || 'props').replace(
+        /[^a-z0-9]+/gi,
+        '_'
+      )
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${baseName}_props.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export ZIP')
+    }
+  }
+
+  // ── Sprite-animation mode handlers ────────────────────────────────────────
+
+  /** Switch the active sprite animation. Replaces the current sheet with a
+   * fresh empty one for the new animation, but PRESERVES the character
+   * anchor so the user can build idle → walk → run → jump → attack for the
+   * same character without re-rolling identity. Also resets FPS to the new
+   * anim's default. */
+  const handleSelectSpriteAnim = (next: SpriteAnimType) => {
+    if (next === spriteAnim) return
+    if (spriteGenerating) return
+    // Persist the current sheet, then restore a previously generated sheet for
+    // the target animation if we have one cached (so the user can flip back and
+    // forth without losing results). Falls back to a fresh empty sheet.
+    spriteSheetCacheRef.current[spriteAnim] = spriteSheet
+    const cached = spriteSheetCacheRef.current[next]
+    setSpriteAnim(next)
+    setSpriteSheet(cached ?? createEmptySpriteSheet(next))
+    setSpriteFps(cached?.fps ?? SPRITE_ANIMATIONS[next].defaultFps)
+    setSpriteProgressMsg(null)
+  }
+
+  /**
+   * Internal: generate the character ANCHOR (Pass 1 of the two-pass sprite
+   * pipeline). Produces a single 512×512 neutral standing reference of the
+   * character on a flat magenta key. Returns both the chroma-keyed
+   * thumbnail and the un-keyed magenta version (which is what gets fed
+   * back into the sheet pass).
+   */
+  const runSpriteAnchorPass = async (
+    prompt: string
+  ): Promise<{ imageUrl: string; rawImageUrl: string }> => {
+    const response = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        width: SPRITE_FRAME_SIZE,
+        height: SPRITE_FRAME_SIZE,
+        artStyle: artStyle !== 'none' ? artStyle : undefined,
+        apiKey: apiKey || undefined,
+        model: selectedModel,
+        spriteAnchor: true,
+        sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+      }),
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      if (response.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+      throw new Error(data.error || 'Failed to generate character anchor')
+    }
+    if (!data.imageUrl) throw new Error('No anchor image returned from API')
+    const rawImageUrl: string = data.imageUrl
+    const keyedImageUrl = await chromaKeyToAlpha(rawImageUrl)
+    return { imageUrl: keyedImageUrl, rawImageUrl }
+  }
+
+  /**
+   * Internal: generate the SHEET (Pass 2 of the two-pass sprite pipeline).
+   *
+   * Before calling the API, this builds a STRUCTURAL GUIDE image: a
+   * 2048×1024 PNG with the anchor pre-composited into each of the 8 grid
+   * cells at pixel-locked position/scale/baseline. The guide is then
+   * passed as the reference image, so the model has a concrete spatial
+   * template to anchor every frame against — not just a loose character
+   * reference. This is the headline fix for position/scale flicker: text
+   * directives alone ("same baseline", "same scale") aren't strong
+   * enough; the model needs to *see* the layout.
+   *
+   * Splits the resulting 4×2 grid into 8 cells, chroma-keys each, and
+   * returns the processed frames.
+   */
+  const runSpriteSheetPass = async (
+    prompt: string,
+    anchorRawUrl: string | null,
+    fixNotes?: string
+  ): Promise<{
+    rawSheetUrl: string
+    keyedCells: string[]
+    keyedSheetUrl: string | null
+  }> => {
+    let guideImage: string | undefined
+    if (anchorRawUrl) {
+      try {
+        guideImage = await buildSpriteSheetGuideDataUrl(anchorRawUrl)
+      } catch (err) {
+        console.warn('Sprite guide build failed; proceeding without it:', err)
+      }
+    }
+    const response = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        width: SPRITE_SHEET_W,
+        height: SPRITE_SHEET_H,
+        artStyle: artStyle !== 'none' ? artStyle : undefined,
+        apiKey: apiKey || undefined,
+        model: selectedModel,
+        spriteSheet: true,
+        spriteAnim,
+        spriteFrameCount: SPRITE_FRAME_COUNT,
+        spriteGridCols: SPRITE_GRID_COLS,
+        spriteGridRows: SPRITE_GRID_ROWS,
+        spriteFrameSize: SPRITE_FRAME_SIZE,
+        spriteGuideImage: guideImage,
+        // The pose-map guide carries STRUCTURE (correct per-frame poses);
+        // the raw anchor carries IDENTITY (outfit, palette, proportions).
+        // Sending both lets the model skin a known character onto a known
+        // pose instead of inventing either.
+        spritePoseGuide: Boolean(guideImage),
+        spriteIdentityImage: anchorRawUrl ?? undefined,
+        spriteFixNotes: fixNotes,
+        sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+      }),
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      if (response.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+      throw new Error(data.error || 'Failed to generate sprite sheet')
+    }
+    if (!data.imageUrl) throw new Error('No image returned from API')
+    const rawSheetUrl: string = data.imageUrl
+    const rawCells = await sliceImageGrid(rawSheetUrl, {
+      cols: SPRITE_GRID_COLS,
+      rows: SPRITE_GRID_ROWS,
+      cellSize: SPRITE_FRAME_SIZE,
+    })
+    const keyedCells = await Promise.all(
+      rawCells.map(async (cellUrl) => {
+        const keyed = await chromaKeyToAlpha(cellUrl)
+        // Strip any dark cell-divider/border line the model painted around the
+        // frame. It isn't magenta, so chroma-keying leaves it as a dark square
+        // outline; this erases full-span border bands at the cell edges.
+        try {
+          return await removeFrameBorder(keyed)
+        } catch {
+          return keyed
+        }
+      })
+    )
+
+    // Baseline alignment — pixel-level post-process that kills the
+    // remaining y-axis drift the model can't fully suppress. Detects the
+    // foot baseline of each chroma-keyed cell from the alpha channel,
+    // then translates each cell so feet match a robust median target.
+    // Airborne frames (jump apex, run mid-air) drift outside the tolerance
+    // window and are preserved as-is, so the animation still has the
+    // intended vertical motion.
+    let alignedCells = keyedCells
+    try {
+      // Jump and run are the only animations with airborne frames; every
+      // other animation is fully grounded, so plant ALL its frames on the
+      // bottom-most foot line (no airborne tolerance, which previously left
+      // a whole drifted row floating above the baseline).
+      const hasAirborne = spriteAnim === 'jump' || spriteAnim === 'run'
+      const alignment = await alignSpriteFramesToBaseline(keyedCells, {
+        maxShift: Math.floor(SPRITE_FRAME_SIZE * 0.2),
+        groundAll: !hasAirborne,
+      })
+      alignedCells = alignment.cells
+      // eslint-disable-next-line no-console
+      console.log('[Sprite] Baseline alignment:', {
+        target: alignment.targetBaseline,
+        detected: alignment.detected,
+        shifted: alignment.shifted,
+      })
+    } catch (err) {
+      console.warn('Sprite baseline alignment failed; using raw cells:', err)
+    }
+
+    // Horizontal centering — pins each frame's center of mass to the cell
+    // center, so the character is centered in-frame and doesn't slide left/
+    // right across cells (kills horizontal "in place" drift on walk/run).
+    try {
+      const centering = await centerSpriteFramesHorizontally(alignedCells, {
+        mode: 'cellCenter',
+      })
+      alignedCells = centering.cells
+      // eslint-disable-next-line no-console
+      console.log('[Sprite] Horizontal centering:', {
+        target: centering.targetCenterX,
+        detected: centering.detected,
+        shifted: centering.shifted,
+      })
+    } catch (err) {
+      console.warn('Sprite horizontal centering failed; using prior cells:', err)
+    }
+
+    const keyedSheetUrl = await composeSpriteGridSheet(alignedCells)
+    return { rawSheetUrl, keyedCells: alignedCells, keyedSheetUrl }
+  }
+
+  /** Review half of the sprite pipeline — hand the composed sheet (+ the
+   * character anchor for identity matching) to the QA art director. Returns
+   * null (≈ approve) on any failure so a flaky critic never blocks the user. */
+  const fetchSpriteReview = async (
+    sheetImage: string | null,
+    anchorImage: string | null
+  ): Promise<{ ok: boolean; issues: string[]; fix: string } | null> => {
+    if (!sheetImage) return null
+    try {
+      const res = await fetch('/api/sprite-review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: spritePrompt.trim() || undefined,
+          anim: spriteAnim,
+          sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
+          apiKey: apiKey || undefined,
+          sheetImage,
+          anchorImage: anchorImage || undefined,
+        }),
+      })
+      if (!res.ok) return null
+      const data = await res.json()
+      if (typeof data?.ok !== 'boolean') return null
+      return data
+    } catch {
+      return null
+    }
+  }
+
+  /** Deterministic twin/clone detector. A correct frame is ONE centered figure
+   * → its alpha column-mass profile is a single hump. When the model paints two
+   * characters side by side, the profile splits into two comparable humps with
+   * a clear empty valley between them. We flag a cell as a "twin" only when the
+   * second hump carries a substantial fraction of the first hump's mass, so a
+   * thin extended weapon (small mass) never trips it. Returns the number of
+   * cells that look duplicated. Best-effort — returns 0 if anything fails. */
+  const detectSpriteDuplicateCells = async (cells: string[]): Promise<number> => {
+    const W = 100 // downscaled analysis width — fast, plenty for column stats
+    const H = 100
+    const analyze = (url: string): Promise<boolean> =>
+      new Promise((resolve) => {
+        const img = new Image()
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas')
+            canvas.width = W
+            canvas.height = H
+            const ctx = canvas.getContext('2d')
+            if (!ctx) return resolve(false)
+            ctx.clearRect(0, 0, W, H)
+            ctx.drawImage(img, 0, 0, W, H)
+            const { data } = ctx.getImageData(0, 0, W, H)
+            const colMass = new Array<number>(W).fill(0)
+            for (let x = 0; x < W; x++) {
+              let m = 0
+              for (let y = 0; y < H; y++) m += data[(y * W + x) * 4 + 3]
+              colMass[x] = m
+            }
+            const peak = Math.max(...colMass)
+            if (peak <= 0) return resolve(false)
+            const occThresh = peak * 0.06
+            // Segment occupied column runs; only an empty gap at least 5% of the
+            // width separates two figures (bridges tiny internal gaps).
+            const minGap = Math.max(3, Math.round(W * 0.05))
+            const segments: { mass: number }[] = []
+            let cur: number | null = null
+            let gap = 0
+            for (let x = 0; x < W; x++) {
+              if (colMass[x] > occThresh) {
+                if (cur === null) {
+                  segments.push({ mass: 0 })
+                  cur = segments.length - 1
+                }
+                segments[cur].mass += colMass[x]
+                gap = 0
+              } else if (cur !== null) {
+                gap++
+                if (gap >= minGap) cur = null
+              }
+            }
+            if (segments.length < 2) return resolve(false)
+            segments.sort((a, b) => b.mass - a.mass)
+            // Two comparable masses ⇒ a real twin; a weapon/limb is far smaller.
+            const twin = segments[1].mass >= segments[0].mass * 0.45
+            resolve(twin)
+          } catch {
+            resolve(false)
+          }
+        }
+        img.onerror = () => resolve(false)
+        img.src = url
+      })
+    try {
+      const flags = await Promise.all(cells.map(analyze))
+      return flags.filter(Boolean).length
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * Generate the sprite sheet — orchestrates the two-pass anchor → sheet
+   * workflow. If an anchor exists (from a previous run or a previous
+   * animation type for the same character), the anchor pass is SKIPPED and
+   * we re-use the existing reference; otherwise we run anchor pass first.
+   *
+   * This is the headline frame-consistency fix: by handing the model a
+   * concrete visual reference of the character before asking it to paint 8
+   * keyframes, the cross-frame identity drift ("flicker") drops sharply.
+   * Backed by independent findings from chongdashu/ai-game-spritesheets,
+   * Robotic Ape, Auto-Sprite, and the Google Cloud Nano Banana prompting
+   * guide — all of 2026.
+   */
+  const handleGenerateSpriteSheet = async ({
+    forceNewAnchor = false,
+  }: { forceNewAnchor?: boolean } = {}) => {
+    if (spriteGenerating) return
+    // An uploaded character supplies the identity, so a text prompt is
+    // optional in that case; otherwise we need a description to lock identity.
+    const hasUploadedAnchor = !!spriteAnchor?.uploaded
+    if (!spritePrompt.trim() && !hasUploadedAnchor) {
+      setError('Describe the character you want — e.g. armored pixel knight.')
+      return
+    }
+    if (!ensureCanGenerate()) return
+    setError(null)
+    spriteStopRef.current = false
+    setSpriteGenerating(true)
+    const startedAt = Date.now()
+
+    // Prompt sent to the sheet pass. With an uploaded character the appearance
+    // comes from the reference image, so fall back to a neutral description.
+    const effectivePrompt =
+      spritePrompt.trim() || 'the character shown in the reference image'
+
+    // Reset the sheet up front so the UI reads as "fresh generation in
+    // progress" while we wait for the API.
+    setSpriteSheet((prev) => ({
+      ...prev,
+      anim: spriteAnim,
+      frames: prev.frames.map((f) => ({ ...f, imageUrl: null })),
+      gridSheetUrl: null,
+      rawGridSheetUrl: null,
+      prompt: effectivePrompt,
+    }))
+
+    // Anchor pass — needed if:
+    //   • No anchor exists yet, OR
+    //   • The user explicitly asked to re-roll the character, OR
+    //   • The prompt changed since the existing anchor was made.
+    // Uploaded anchors are never regenerated from the prompt — the image IS
+    // the source of truth for identity.
+    const needsNewAnchor =
+      forceNewAnchor ||
+      !spriteAnchor ||
+      (!spriteAnchor.uploaded &&
+        spriteAnchor.prompt.trim() !== spritePrompt.trim())
+
+    if (needsNewAnchor) {
+      setSpriteAnchor(null)
+      // The character is changing, so previously cached animations belong to
+      // the old identity — drop them to avoid mixing characters across tabs.
+      spriteSheetCacheRef.current = {}
+    }
+
+    // Up to this many extra repaint passes after the first sheet, each driven
+    // by the QA art director's fix report.
+    const MAX_SPRITE_REVIEW_PASSES = 2
+    let phaseLabel = needsNewAnchor
+      ? 'Locking character (1/2)'
+      : 'Painting frames (2/2)'
+    const tickHandle = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      setSpriteProgressMsg(`${phaseLabel} · ${elapsed}s`)
+    }, 1000)
+
+    try {
+      let anchorRef = spriteAnchor
+      if (needsNewAnchor) {
+        const anchorResult = await runSpriteAnchorPass(effectivePrompt)
+        if (spriteStopRef.current) return
+        anchorRef = {
+          imageUrl: anchorResult.imageUrl,
+          rawImageUrl: anchorResult.rawImageUrl,
+          prompt: effectivePrompt,
+        }
+        setSpriteAnchor(anchorRef)
+      }
+
+      // Pass 2 with a QA loop: paint the sheet, hand it (and the locked anchor)
+      // to the art director, and repaint with its fix report if it flags
+      // identity flicker / scale / anatomy / fringe problems. The anchor
+      // identity is reused on every repaint so the character stays on-model.
+      // The frames stay in their loading state through review/repaint so the
+      // sheet visibly shows it's still working.
+      phaseLabel = 'Painting frames (2/2)'
+      let sheetResult = await runSpriteSheetPass(
+        effectivePrompt,
+        anchorRef?.rawImageUrl ?? null
+      )
+      if (spriteStopRef.current) return
+
+      let fixNotes: string | undefined
+      for (let pass = 0; pass < MAX_SPRITE_REVIEW_PASSES; pass++) {
+        phaseLabel = 'Art director reviewing'
+        setSpriteProgressMsg('Art director reviewing…')
+
+        // Deterministic twin check (cheap, reliable) + vision critique. The
+        // twin detector guarantees we catch side-by-side duplicates even if the
+        // vision critic misses them, then prepends a forceful fix instruction.
+        const [twinCount, review] = await Promise.all([
+          detectSpriteDuplicateCells(sheetResult.keyedCells),
+          fetchSpriteReview(sheetResult.keyedSheetUrl, anchorRef?.imageUrl ?? null),
+        ])
+        if (spriteStopRef.current) return
+
+        const visionBad = !!review && !review.ok
+        if (twinCount === 0 && !visionBad) {
+          if (debugMode && review) {
+            // eslint-disable-next-line no-console
+            console.log('🎭 QA approved the sprite sheet')
+          }
+          break
+        }
+
+        const dupNote =
+          twinCount > 0
+            ? `CRITICAL DEFECT: ${twinCount} cell(s) contain TWO copies of the character standing side by side. Paint EXACTLY ONE single character per cell, centered — completely remove the duplicate/twin/clone figure. This is the highest-priority fix. `
+            : ''
+        const visionNote = visionBad
+          ? review!.fix || review!.issues.join('; ')
+          : ''
+        fixNotes = (dupNote + visionNote).trim()
+        if (!fixNotes) break // nothing actionable — accept.
+        if (debugMode) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `🎭 QA rejected (twins: ${twinCount}), repainting with notes:`,
+            fixNotes
+          )
+        }
+
+        phaseLabel = `Repainting frames (pass ${pass + 2})`
+        setSpriteProgressMsg(
+          twinCount > 0 ? 'Duplicate found — repainting…' : 'Issues found — repainting…'
+        )
+        sheetResult = await runSpriteSheetPass(
+          effectivePrompt,
+          anchorRef?.rawImageUrl ?? null,
+          fixNotes
+        )
+        if (spriteStopRef.current) return
+      }
+
+      setSpriteSheet((prev) => ({
+        ...prev,
+        anim: spriteAnim,
+        frames: sheetResult.keyedCells.map((url, i) => ({
+          index: i,
+          imageUrl: url,
+        })),
+        gridSheetUrl: sheetResult.keyedSheetUrl,
+        rawGridSheetUrl: sheetResult.rawSheetUrl,
+        prompt: effectivePrompt,
+        fps: spriteFps,
+      }))
+    } catch (err) {
+      setSpriteSheet((prev) => ({
+        ...prev,
+        frames: prev.frames.map((f) => ({ ...f, imageUrl: null })),
+      }))
+      setError(
+        err instanceof Error ? err.message : 'Failed to generate sprite sheet'
+      )
+    } finally {
+      clearInterval(tickHandle)
+      setSpriteGenerating(false)
+      setSpriteProgressMsg(null)
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+      // eslint-disable-next-line no-console
+      if (debugMode) console.log(`🎭 Sprite sheet generated in ${elapsed}s`)
+    }
+  }
+
+  /** Discard the current anchor + sheet and re-run the full two-pass
+   * pipeline. Use this when you want a completely fresh character (vs.
+   * keeping the same character and only re-rolling poses for the current
+   * animation, which is what the main "Generate" button does). */
+  const handleRerollSpriteCharacter = () => {
+    if (spriteGenerating) return
+    handleGenerateSpriteSheet({ forceNewAnchor: true })
+  }
+
+  /**
+   * Turn an arbitrary uploaded character image into a sprite anchor that
+   * matches what the generation pass produces: the subject is contained inside
+   * a single SPRITE_FRAME_SIZE cell, bottom-aligned with margin, on a magenta
+   * background (the AI reads magenta as background more reliably than alpha).
+   * Returns both the magenta version (for the AI) and a chroma-keyed,
+   * transparent version (for display).
+   */
+  const buildSpriteAnchorFromUpload = async (
+    rawDataUrl: string
+  ): Promise<{ imageUrl: string; rawImageUrl: string }> => {
+    // Strip any baked-in checkerboard / solid backdrop first (no-op for assets
+    // that already have real transparency) so it doesn't get composited as art.
+    let dataUrl = rawDataUrl
+    try {
+      dataUrl = await removeUploadedBackground(rawDataUrl)
+    } catch {
+      dataUrl = rawDataUrl
+    }
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      img.onload = async () => {
+        try {
+          const S = SPRITE_FRAME_SIZE
+          const canvas = document.createElement('canvas')
+          canvas.width = S
+          canvas.height = S
+          const ctx = canvas.getContext('2d')
+          if (!ctx) return reject(new Error('Canvas unavailable'))
+          // Magenta backdrop — transparent areas of the upload become magenta,
+          // exactly like a generated anchor.
+          ctx.fillStyle = '#FF00FF'
+          ctx.fillRect(0, 0, S, S)
+          // Contain the character with margin, feet near the bottom (~94%).
+          const maxW = S * 0.84
+          const maxH = S * 0.9
+          const scale = Math.min(maxW / img.width, maxH / img.height)
+          const dw = img.width * scale
+          const dh = img.height * scale
+          const dx = (S - dw) / 2
+          const dy = S * 0.95 - dh
+          ctx.imageSmoothingEnabled = true
+          ctx.drawImage(img, dx, dy, dw, dh)
+          const rawImageUrl = canvas.toDataURL('image/png')
+          const imageUrl = await chromaKeyToAlpha(rawImageUrl)
+          resolve({ imageUrl, rawImageUrl })
+        } catch (err) {
+          reject(err)
+        }
+      }
+      img.onerror = () => reject(new Error('Could not load the uploaded image'))
+      img.src = dataUrl
+    })
+  }
+
+  /** Accept a user-supplied character image and lock it in as the anchor so the
+   * sheet pass animates THAT character instead of generating a new one. */
+  const handleUploadSpriteCharacter = async (file: File) => {
+    if (spriteGenerating) return
+    if (!file.type.startsWith('image/')) {
+      setError('Please choose an image file (PNG with transparency works best).')
+      return
+    }
+    setError(null)
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = () => reject(new Error('Failed to read the file'))
+        reader.readAsDataURL(file)
+      })
+      const { imageUrl, rawImageUrl } = await buildSpriteAnchorFromUpload(dataUrl)
+      // A new character → drop cached animations from the previous one and
+      // clear the current sheet so the user starts clean.
+      spriteSheetCacheRef.current = {}
+      setSpriteAnchor({
+        imageUrl,
+        rawImageUrl,
+        prompt: spritePrompt.trim() || 'Uploaded character',
+        uploaded: true,
+      })
+      setSpriteSheet(createEmptySpriteSheet(spriteAnim))
+      setSpriteProgressMsg(null)
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to process the uploaded character image'
+      )
+    }
+  }
+
+  /** Remove the uploaded character so the user can switch back to a starter
+   * preset or their own prompt. Keeps the typed prompt intact; drops the
+   * anchor, the orphaned cached animations, and the current sheet. */
+  const handleRemoveUploadedCharacter = () => {
+    if (spriteGenerating) return
+    spriteSheetCacheRef.current = {}
+    setSpriteAnchor(null)
+    setSpriteSheet(createEmptySpriteSheet(spriteAnim))
+    setSpriteProgressMsg(null)
+    setError(null)
+  }
+
+  const handleStopSpriteSheet = () => {
+    spriteStopRef.current = true
+  }
+
+  /** Toggle a single frame's excluded state. Excluded frames are dropped from
+   * playback and from every export (grid, strip, per-frame ZIP, manifest). */
+  const handleToggleSpriteFrame = (index: number) => {
+    setSpriteSheet((prev) => ({
+      ...prev,
+      frames: prev.frames.map((f) =>
+        f.index === index && f.imageUrl
+          ? { ...f, disabled: !f.disabled }
+          : f
+      ),
+    }))
+  }
+
+  const handleClearSpriteSheet = () => {
+    spriteSheetCacheRef.current = {}
+    setSpriteSheet(createEmptySpriteSheet(spriteAnim))
+    setSpriteAnchor(null)
+    setSpritePrompt('')
+    setSpriteProgressMsg(null)
+    setSpriteFps(SPRITE_ANIMATIONS[spriteAnim].defaultFps)
+    spriteStopRef.current = false
+    setError(null)
+  }
+
+  /**
+   * Build the POSE-MAP GUIDE that's fed to the sheet-generation pass.
+   *
+   * The old approach stamped the SAME neutral anchor into all 8 cells and
+   * begged the model (in text) to "ignore that pose and do the walk cycle
+   * instead." That fails: a diffusion model obeys an image guide far more
+   * strongly than text, so the dominant signal said "stand still" in every
+   * cell and the model copied neutral or drifted into random leg phases.
+   *
+   * The new approach renders a deterministic skeletal MANNEQUIN per frame
+   * (see utils/poseRig) in the exact, biomechanically-correct pose that
+   * frame must hold — a from-scratch ControlNet/OpenPose-style pose map.
+   * The motion is now guaranteed correct by code; the model only has to
+   * skin the character onto each pose. Identity/appearance is supplied
+   * separately via the raw anchor image (see runSpriteSheetPass), so the
+   * model gets "what the character looks like" + "what pose to hold."
+   *
+   * We measure the anchor's bounding box so the mannequin matches the
+   * character's height, horizontal center, and foot baseline — keeping the
+   * pose map aligned with the identity reference and the downstream
+   * baseline-alignment pass.
+   */
+  const buildSpriteSheetGuideDataUrl = async (
+    anchorRawImageUrl: string
+  ): Promise<string> => {
+    const subject = await measureAnchorSubject(anchorRawImageUrl)
+    const canvas = document.createElement('canvas')
+    canvas.width = SPRITE_SHEET_W
+    canvas.height = SPRITE_SHEET_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('Failed to create sprite-guide canvas')
+    ctx.imageSmoothingEnabled = true
+    drawPoseGuideSheet(ctx, {
+      anim: spriteAnim,
+      cols: SPRITE_GRID_COLS,
+      rows: SPRITE_GRID_ROWS,
+      cellSize: SPRITE_FRAME_SIZE,
+      frameCount: SPRITE_FRAME_COUNT,
+      subject,
+    })
+    return canvas.toDataURL('image/png')
+  }
+
+  /**
+   * Measure where the character sits inside a single anchor cell (height,
+   * horizontal center, foot baseline) so the rendered pose mannequin matches
+   * the character's body plan. Falls back to sensible defaults if the anchor
+   * can't be measured (e.g. solid/empty frame).
+   */
+  const measureAnchorSubject = async (
+    anchorRawImageUrl: string
+  ): Promise<SubjectBounds> => {
+    const fallback: SubjectBounds = {
+      height: Math.round(SPRITE_FRAME_SIZE * 0.78),
+      centerX: SPRITE_FRAME_SIZE / 2,
+      baseline: Math.round(SPRITE_FRAME_SIZE * 0.92),
+    }
+    try {
+      return await new Promise<SubjectBounds>((resolve) => {
+        const img = new Image()
+        img.crossOrigin = 'anonymous'
+        img.onload = () => {
+          const c = document.createElement('canvas')
+          c.width = SPRITE_FRAME_SIZE
+          c.height = SPRITE_FRAME_SIZE
+          const cx = c.getContext('2d')
+          if (!cx) return resolve(fallback)
+          cx.drawImage(img, 0, 0, SPRITE_FRAME_SIZE, SPRITE_FRAME_SIZE)
+          const { data } = cx.getImageData(
+            0,
+            0,
+            SPRITE_FRAME_SIZE,
+            SPRITE_FRAME_SIZE
+          )
+          const measured = measureSubjectBounds(
+            data,
+            SPRITE_FRAME_SIZE,
+            SPRITE_FRAME_SIZE
+          )
+          resolve(measured ?? fallback)
+        }
+        img.onerror = () => resolve(fallback)
+        img.src = anchorRawImageUrl
+      })
+    } catch {
+      return fallback
+    }
+  }
+
+  /** Stitch keyed cells into a 4×2 grid PNG. Used for manifest export. */
+  const composeSpriteGridSheet = async (
+    cells: string[]
+  ): Promise<string | null> => {
+    if (cells.length === 0) return null
+    const canvas = document.createElement('canvas')
+    canvas.width = SPRITE_SHEET_W
+    canvas.height = SPRITE_SHEET_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.imageSmoothingEnabled = false
+    await Promise.all(
+      cells.map(
+        (url, i) =>
+          new Promise<void>((resolve, reject) => {
+            const r = Math.floor(i / SPRITE_GRID_COLS)
+            const c = i % SPRITE_GRID_COLS
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(
+                img,
+                c * SPRITE_FRAME_SIZE,
+                r * SPRITE_FRAME_SIZE,
+                SPRITE_FRAME_SIZE,
+                SPRITE_FRAME_SIZE
+              )
+              resolve()
+            }
+            img.onerror = () => reject(new Error(`Failed to load sprite frame ${i}`))
+            img.src = url
+          })
+      )
+    )
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Stitch keyed cells into a single horizontal strip (1 row × N frames).
+   * Most 2D engines (Phaser, Unity 2D, Godot, Defold) prefer this layout. */
+  const composeSpriteStripSheet = async (
+    cells: string[]
+  ): Promise<string | null> => {
+    if (cells.length === 0) return null
+    const canvas = document.createElement('canvas')
+    // Size to the number of frames actually being exported so excluded frames
+    // don't leave transparent gaps on the right of the strip.
+    canvas.width = cells.length * SPRITE_FRAME_SIZE
+    canvas.height = SPRITE_STRIP_H
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.imageSmoothingEnabled = false
+    await Promise.all(
+      cells.map(
+        (url, i) =>
+          new Promise<void>((resolve, reject) => {
+            const img = new Image()
+            img.onload = () => {
+              ctx.drawImage(
+                img,
+                i * SPRITE_FRAME_SIZE,
+                0,
+                SPRITE_FRAME_SIZE,
+                SPRITE_FRAME_SIZE
+              )
+              resolve()
+            }
+            img.onerror = () => reject(new Error(`Failed to load sprite frame ${i}`))
+            img.src = url
+          })
+      )
+    )
+    return canvas.toDataURL('image/png')
+  }
+
+  /** Engine-friendly manifest describing both grid and strip layouts plus
+   * per-frame timing data so importers can wire up an Animation directly. */
+  // `activeFrames` are the kept (non-excluded) frames. They are repacked
+  // contiguously in row-major order, so the manifest coordinates describe the
+  // EXPORTED sheets (which also only contain the kept frames) rather than the
+  // original 8-cell layout. `sourceIndex` preserves the original slot for
+  // reference.
+  const buildSpriteManifest = (activeFrames: SpriteFrame[]) => {
+    const spec = SPRITE_ANIMATIONS[spriteAnim]
+    const count = activeFrames.length
+    const stripCols = Math.max(1, count)
+    return {
+      version: 1,
+      anim: spriteAnim,
+      label: spec.label,
+      frameCount: count,
+      frameSize: SPRITE_FRAME_SIZE,
+      fps: spriteFps,
+      frameDurationMs: Math.round(1000 / spriteFps),
+      loop: spec.loop,
+      grid: {
+        fileName: 'sheet.png',
+        cols: SPRITE_GRID_COLS,
+        rows: SPRITE_GRID_ROWS,
+        sheetWidth: SPRITE_SHEET_W,
+        sheetHeight: SPRITE_SHEET_H,
+      },
+      strip: {
+        fileName: 'strip.png',
+        cols: stripCols,
+        rows: 1,
+        sheetWidth: stripCols * SPRITE_FRAME_SIZE,
+        sheetHeight: SPRITE_STRIP_H,
+      },
+      prompt: spriteSheet.prompt || spritePrompt,
+      sceneBrief: sceneBrief.trim() || null,
+      artStyle: artStyle !== 'none' ? artStyle : null,
+      frames: activeFrames.map((f, i) => ({
+        index: i,
+        sourceIndex: f.index,
+        fileName: `frame_${String(i + 1).padStart(2, '0')}.png`,
+        gridCol: i % SPRITE_GRID_COLS,
+        gridRow: Math.floor(i / SPRITE_GRID_COLS),
+        gridX: (i % SPRITE_GRID_COLS) * SPRITE_FRAME_SIZE,
+        gridY: Math.floor(i / SPRITE_GRID_COLS) * SPRITE_FRAME_SIZE,
+        stripX: i * SPRITE_FRAME_SIZE,
+        stripY: 0,
+      })),
+    }
+  }
+
+  const handleDownloadSpriteSheet = async () => {
+    try {
+      const populated = spriteSheet.frames.filter(
+        (f) => !!f.imageUrl && !f.disabled
+      )
+      if (populated.length === 0) {
+        setError(
+          spriteSheet.frames.some((f) => !!f.imageUrl)
+            ? 'All frames are excluded — click a frame to include it before downloading.'
+            : 'Generate the sheet before downloading.'
+        )
+        return
+      }
+      const cellUrls = populated.map((f) => f.imageUrl as string)
+      // Always recompose from the kept cells (cached gridSheetUrl still
+      // contains excluded frames).
+      const grid = await composeSpriteGridSheet(cellUrls)
+      const strip = await composeSpriteStripSheet(cellUrls)
+      const baseName = `${spriteAnim}_${(
+        spritePrompt.trim().slice(0, 24) || 'sprite'
+      ).replace(/[^a-z0-9]+/gi, '_')}`
+
+      if (grid) {
+        const link = document.createElement('a')
+        link.href = grid
+        link.download = `${baseName}_grid_${SPRITE_SHEET_W}x${SPRITE_SHEET_H}.png`
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+      }
+      if (strip) {
+        const link = document.createElement('a')
+        link.href = strip
+        link.download = `${baseName}_strip_${SPRITE_STRIP_W}x${SPRITE_STRIP_H}.png`
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+      }
+      // Manifest as sidecar JSON.
+      const json = JSON.stringify(buildSpriteManifest(populated), null, 2)
+      const jsonUrl = URL.createObjectURL(
+        new Blob([json], { type: 'application/json' })
+      )
+      const linkJson = document.createElement('a')
+      linkJson.href = jsonUrl
+      linkJson.download = `${baseName}_manifest.json`
+      document.body.appendChild(linkJson)
+      linkJson.click()
+      document.body.removeChild(linkJson)
+      URL.revokeObjectURL(jsonUrl)
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Failed to export sprite sheet'
+      )
+    }
+  }
+
+  const handleDownloadSpriteZip = async () => {
+    try {
+      const populated = spriteSheet.frames.filter(
+        (f) => !!f.imageUrl && !f.disabled
+      )
+      if (populated.length === 0) {
+        setError(
+          spriteSheet.frames.some((f) => !!f.imageUrl)
+            ? 'All frames are excluded — click a frame to include it before exporting.'
+            : 'Generate the sheet before exporting the ZIP.'
+        )
+        return
+      }
+      const cellUrls = populated.map((f) => f.imageUrl as string)
+      const zip = new JSZip()
+      // Per-frame PNGs (engines that prefer one file per frame). Reindexed to
+      // contiguous positions so filenames match the repacked manifest/strip.
+      populated.forEach((f, i) => {
+        if (!f.imageUrl) return
+        const base64 = f.imageUrl.split(',')[1]
+        if (base64) {
+          const name = `frame_${String(i + 1).padStart(2, '0')}.png`
+          zip.file(name, base64, { base64: true })
+        }
+      })
+      // Combined grid sheet (recomposed from kept cells).
+      const grid = await composeSpriteGridSheet(cellUrls)
+      if (grid) {
+        const b64 = grid.split(',')[1]
+        if (b64) zip.file('sheet.png', b64, { base64: true })
+      }
+      // Horizontal strip for engines that want one row.
+      const strip = await composeSpriteStripSheet(cellUrls)
+      if (strip) {
+        const b64 = strip.split(',')[1]
+        if (b64) zip.file('strip.png', b64, { base64: true })
+      }
+      zip.file(
+        'manifest.json',
+        JSON.stringify(buildSpriteManifest(populated), null, 2)
+      )
+
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const baseName = `${spriteAnim}_${(
+        spritePrompt.trim().slice(0, 24) || 'sprite'
+      ).replace(/[^a-z0-9]+/gi, '_')}`
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${baseName}_sprite.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export ZIP')
+    }
+  }
+
+  // ── Parallax: extend-to-target loop, full-image download, tile export ─────
+
+  /**
+   * Auto-extend rightward, accepting the best variant each time, until the
+   * image reaches `parallaxTargetWidth` (or the safety cap). Skips the
+   * normal candidate-review UI — the user sets a goal and walks away.
+   */
+  const handleAutoExtend = async () => {
+    if (loading || parallaxAutoExtending) return
+    if (!ensureCanGenerate()) return
+    if (!parallaxTargetWidth) return
+
+    // Resolve the right source/role/dims based on mode. In parallax mode
+    // we operate on the active layer's raw image; in extender mode on the
+    // global selectedImage.
+    const { sourceImage, layerRole } = resolveExtendSource()
+    if (!sourceImage) return
+    const startDims =
+      mode === 'parallax' && activeLayer && activeLayer.width && activeLayer.height
+        ? { width: activeLayer.width, height: activeLayer.height }
+        : currentImageDimensions
+    if (!startDims) return
+    if (startDims.width >= parallaxTargetWidth) return
+
+    setError(null)
+    parallaxAutoStopRef.current = false
+    setParallaxAutoExtending(true)
+    setActiveDirection('right')
+    setImageBeforeExtension(sourceImage)
+    setLastExtensionParams({ direction: 'right', customPrompt, artStyle, layerRole })
+    setExtendedCandidates([])
+    setCandidateDims([])
+    setSelectedCandidateIdx(0)
+
+    let currentSource = sourceImage
+    let currentDims = { ...startDims }
+    let stepCount = 0
+
+    try {
+      while (
+        currentDims.width < parallaxTargetWidth &&
+        stepCount < PARALLAX_MAX_AUTO_STEPS &&
+        !parallaxAutoStopRef.current
+      ) {
+        stepCount++
+        setLoading(true)
+        setProgressMsg(
+          `Auto step ${stepCount} · ${currentDims.width} → ${parallaxTargetWidth}px`
+        )
+
+        const candidates = await runExtend(
+          'right',
+          currentSource,
+          customPrompt,
+          artStyle,
+          layerRole
+        )
+        if (parallaxAutoStopRef.current) break
+        const best = candidates[0]
+
+        // The next loop iteration must feed the un-keyed magenta image back
+        // into the model for keyed layers; for sky / extender mode, raw and
+        // display are the same.
+        const nextSource = best.rawImageUrl ?? best.imageUrl
+        currentSource = nextSource
+        const newDims = await getImageDimensions(best.imageUrl)
+        currentDims = newDims
+
+        if (mode === 'parallax') {
+          patchActiveLayer({
+            imageUrl: best.imageUrl,
+            rawImageUrl: nextSource,
+            width: newDims.width,
+            height: newDims.height,
+          })
+        } else {
+          setSelectedImage(best.imageUrl)
+          setCurrentImageDimensions(newDims)
+        }
+        setLoading(false)
+      }
+    } catch (err) {
+      const e = err as Error & { status?: number }
+      setError(e.message || 'Auto-extend failed')
+      if (e.status === 401) {
+        setApiKeyRequired(true)
+        setShowApiKeyModal(true)
+      }
+    } finally {
+      setLoading(false)
+      setActiveDirection(null)
+      setProgressMsg(null)
+      setParallaxAutoExtending(false)
+      parallaxAutoStopRef.current = false
+    }
+
+    // Make the freshly-extended layer tileable so the renderer's repeat-x
+    // doesn't show a hard discontinuity at the loop point. This is the most
+    // common pain in parallax workflows — the AI generates a beautiful
+    // continuous strip, but its left and right edges were never asked to
+    // match each other, so games that tile the texture see a seam every W
+    // pixels. Auto-applying here means the default output Just Works.
+    // (Manual `Harmonize` is still available for the separate "panel
+    // banding from cumulative AI drift" issue.)
+    if (mode === 'parallax' && !parallaxAutoStopRef.current) {
+      try {
+        setLoading(true)
+        setProgressMsg('Closing the loop…')
+        await makeLayerTileableByIdx(parallaxActiveIdx)
+      } catch {
+        // Non-fatal — leave the un-tiled result in place.
+      } finally {
+        setLoading(false)
+        setProgressMsg(null)
+      }
+    }
+  }
+
+  const handleStopAutoExtend = () => {
+    parallaxAutoStopRef.current = true
+    setProgressMsg('Stopping after this step…')
+  }
+
+  /**
+   * Open the text-to-image generator. In parallax mode, pre-fill the
+   * role-specific default dimensions so the user doesn't have to think
+   * about it: Sky is taller (covers the whole sky-to-horizon band), keyed
+   * layers (Far / Mid / Near) are shorter (they only need to cover the
+   * band their elements sit in). Same-role re-generations match the
+   * existing layer's exact dimensions so a regenerate never changes
+   * the canvas size. Prompt is seeded with a role-specific scaffold.
+   */
+  const openGenerateModal = () => {
+    if (mode === 'parallax' && activeLayer) {
+      const spec = LAYER_ROLES[activeLayer.role]
+      // If the SAME layer already has dimensions (e.g. user is regenerating
+      // after extending), keep them so the regenerate is a drop-in replacement.
+      if (activeLayer.width && activeLayer.height) {
+        setGenerateWidth(activeLayer.width)
+        setGenerateHeight(activeLayer.height)
+      } else {
+        setGenerateWidth(spec.defaultWidth)
+        setGenerateHeight(spec.defaultHeight)
+      }
+      if (!generatePrompt.trim()) {
+        setGeneratePrompt(spec.defaultPrompt)
+      }
+    }
+    setShowGenerateModal(true)
+  }
+
+  /**
+   * Download the active layer's PNG (or, in extender mode, the current
+   * canvas). In parallax mode this respects the layer's keyed alpha.
+   */
+  const handleDownloadFull = () => {
+    if (mode === 'parallax') {
+      const layer = activeLayer
+      if (!layer || !layer.imageUrl) return
+      const link = document.createElement('a')
+      link.href = layer.imageUrl
+      const w = layer.width ?? 0
+      const h = layer.height ?? 0
+      link.download = `parallax_${layer.role}_${w}x${h}.png`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      return
+    }
+    const target = activeCandidate?.imageUrl ?? selectedImage
+    const dims = activeCandidate
+      ? candidateDims[selectedCandidateIdx] ?? null
+      : currentImageDimensions
+    if (!target || !dims) return
+    const link = document.createElement('a')
+    link.href = target
+    const baseName = originalFileName.replace(/\.[^/.]+$/, '') || 'parallax'
+    link.download = `${baseName}_${dims.width}x${dims.height}.png`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }
+
+  /**
+   * Export the entire parallax project as a ZIP: one PNG per populated
+   * layer plus a `parallax.json` manifest describing depth order, scroll
+   * speeds, and dimensions. The manifest is engine-friendly so Unity /
+   * Godot / Phaser users can wire it straight into a parallax controller.
+   */
+  const handleExportZip = async () => {
+    const populated = parallaxLayers.filter((l) => l.imageUrl)
+    if (populated.length === 0) {
+      setError('No layers to export. Generate or upload at least one layer first.')
+      return
+    }
+    setProgressMsg('Packaging ZIP…')
+    try {
+      const zip = new JSZip()
+      const manifest: {
+        version: number
+        createdAt: string
+        sceneBrief?: string
+        layers: {
+          role: LayerRole
+          file: string
+          width: number | null
+          height: number | null
+          scrollSpeed: number
+          opaque: boolean
+        }[]
+      } = {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        ...(sceneBrief.trim() ? { sceneBrief: sceneBrief.trim() } : {}),
+        layers: [],
+      }
+      for (const layer of parallaxLayers) {
+        if (!layer.imageUrl) continue
+        const filename = `${layer.role}.png`
+        const dataUrl = layer.imageUrl
+        const base64 = dataUrl.split(',')[1] ?? ''
+        zip.file(filename, base64, { base64: true })
+        manifest.layers.push({
+          role: layer.role,
+          file: filename,
+          width: layer.width,
+          height: layer.height,
+          scrollSpeed: layer.scrollSpeed,
+          opaque: LAYER_ROLES[layer.role].isOpaque,
+        })
+      }
+      zip.file('parallax.json', JSON.stringify(manifest, null, 2))
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `parallax_project_${Date.now()}.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      // Revoke the blob URL on the next tick so the click has fired.
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to build ZIP')
+    } finally {
+      setProgressMsg(null)
+    }
+  }
+
+  /**
+   * Run the horizontal-seam harmonizer on a single parallax layer (or on the
+   * extender canvas) and write the result back. For sky / extender images
+   * we operate on the displayable image directly. For keyed layers we have
+   * to work on the un-keyed magenta source — otherwise alpha=0 regions
+   * dominate the column means, the magenta itself drifts, or both. After
+   * harmonizing the raw we re-apply chroma-keying for the displayable copy.
+   */
+  const harmonizeLayerByIdx = useCallback(
+    async (idx: number, strength = 0.85) => {
+      const layer = parallaxLayers[idx]
+      if (!layer || !layer.imageUrl) return
+      const isKeyed = !LAYER_ROLES[layer.role].isOpaque
+      if (isKeyed && layer.rawImageUrl) {
+        const harmonizedRaw = await harmonizeHorizontalSeams(
+          layer.rawImageUrl,
+          {
+            strength,
+            ignoreKeyColor: { r: 255, g: 0, b: 255, threshold: 80 },
+          }
+        )
+        const harmonizedDisplay = await chromaKeyToAlpha(harmonizedRaw)
+        setParallaxLayers((prev) =>
+          prev.map((l, i) =>
+            i === idx
+              ? { ...l, imageUrl: harmonizedDisplay, rawImageUrl: harmonizedRaw }
+              : l
+          )
+        )
+      } else {
+        const harmonized = await harmonizeHorizontalSeams(layer.imageUrl, {
+          strength,
+        })
+        setParallaxLayers((prev) =>
+          prev.map((l, i) =>
+            i === idx
+              ? { ...l, imageUrl: harmonized, rawImageUrl: harmonized }
+              : l
+          )
+        )
+      }
+    },
+    [parallaxLayers]
+  )
+
+  /**
+   * User-triggered harmonize for the active parallax layer. Surfaces a
+   * progress pill while running because the column-mean pass can take a
+   * couple of seconds on long backgrounds.
+   */
+  const handleHarmonizeActiveLayer = async () => {
+    if (mode !== 'parallax') return
+    if (loading || parallaxAutoExtending) return
+    const layer = parallaxLayers[parallaxActiveIdx]
+    if (!layer || !layer.imageUrl) return
+    setError(null)
+    setLoading(true)
+    setProgressMsg('Harmonizing seams…')
+    try {
+      await harmonizeLayerByIdx(parallaxActiveIdx)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to harmonize')
+    } finally {
+      setLoading(false)
+      setProgressMsg(null)
+    }
+  }
+
+  /**
+   * Turn the active layer's image into a horizontally tileable texture so
+   * `repeat-x` doesn't show a hard discontinuity at the loop point. For
+   * keyed layers we operate on the un-keyed magenta source and re-key for
+   * display (otherwise the magenta key would get tinted at the seam strip).
+   */
+  const makeLayerTileableByIdx = useCallback(
+    async (idx: number) => {
+      const layer = parallaxLayers[idx]
+      if (!layer || !layer.imageUrl) return
+      const isKeyed = !LAYER_ROLES[layer.role].isOpaque
+      if (isKeyed && layer.rawImageUrl) {
+        const tileableRaw = await makeHorizontallyTileable(
+          layer.rawImageUrl,
+          {
+            ignoreKeyColor: { r: 255, g: 0, b: 255, threshold: 80 },
+          }
+        )
+        const tileableDisplay = await chromaKeyToAlpha(tileableRaw)
+        setParallaxLayers((prev) =>
+          prev.map((l, i) =>
+            i === idx
+              ? { ...l, imageUrl: tileableDisplay, rawImageUrl: tileableRaw }
+              : l
+          )
+        )
+      } else {
+        const tileable = await makeHorizontallyTileable(layer.imageUrl)
+        setParallaxLayers((prev) =>
+          prev.map((l, i) =>
+            i === idx
+              ? { ...l, imageUrl: tileable, rawImageUrl: tileable }
+              : l
+          )
+        )
+      }
+    },
+    [parallaxLayers]
+  )
+
+  const handleMakeActiveLayerTileable = async () => {
+    if (mode !== 'parallax') return
+    if (loading || parallaxAutoExtending) return
+    const layer = parallaxLayers[parallaxActiveIdx]
+    if (!layer || !layer.imageUrl) return
+    setError(null)
+    setLoading(true)
+    setProgressMsg('Making tileable…')
+    try {
+      await makeLayerTileableByIdx(parallaxActiveIdx)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to make tileable')
+    } finally {
+      setLoading(false)
+      setProgressMsg(null)
+    }
   }
 
   // Keyboard shortcuts
@@ -2038,7 +3603,11 @@ export default function Home() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return
       }
-      if (!selectedImage || loading) return
+      // In parallax mode the active "image" is the active layer; in extender
+      // mode it's the global selectedImage.
+      const sourceAvailable =
+        mode === 'parallax' ? !!activeLayer?.imageUrl : !!selectedImage
+      if (!sourceAvailable || loading || parallaxAutoExtending) return
       if (activeCandidate) {
         if (e.key === 'Enter') handleAccept()
         else if (e.key === 'Escape') handleDiscard()
@@ -2052,12 +3621,17 @@ export default function Home() {
         }
         return
       }
-      const mapping: Record<string, Direction> = {
-        ArrowUp: 'up',
-        ArrowDown: 'down',
-        ArrowLeft: 'left',
-        ArrowRight: 'right',
-      }
+      // In parallax mode, only horizontal extends are meaningful — up/down
+      // would warp the locked game height. Silently ignore them so users
+      // don't accidentally break their parallax aspect ratio.
+      const mapping: Record<string, Direction> = mode === 'parallax'
+        ? { ArrowLeft: 'left', ArrowRight: 'right' }
+        : {
+            ArrowUp: 'up',
+            ArrowDown: 'down',
+            ArrowLeft: 'left',
+            ArrowRight: 'right',
+          }
       const dir = mapping[e.key]
       if (dir) {
         e.preventDefault()
@@ -2067,7 +3641,17 @@ export default function Home() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedImage, loading, activeCandidate, extendedCandidates.length, customPrompt, artStyle])
+  }, [
+    selectedImage,
+    loading,
+    activeCandidate,
+    extendedCandidates.length,
+    customPrompt,
+    artStyle,
+    mode,
+    parallaxAutoExtending,
+    activeLayer,
+  ])
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -2078,18 +3662,188 @@ export default function Home() {
   const isResult = !!activeCandidate
   const variantCount = extendedCandidates.length
 
+  const isParallax = mode === 'parallax'
+  const isTile = mode === 'tile'
+  const isSprite = mode === 'sprite'
+  const isProps = mode === 'props'
+
+  const variantSelectorEl =
+    isResult && variantCount > 1 ? (
+      <VariantSelector
+        index={selectedCandidateIdx}
+        total={variantCount}
+        isBest={selectedCandidateIdx === 0}
+        score={debugMode ? activeCandidate?.score : undefined}
+        onPrev={() => cycleVariant(-1)}
+        onNext={() => cycleVariant(1)}
+      />
+    ) : undefined
+
+  const resultActionsEl = isResult ? (
+    <ResultActions
+      onAccept={handleAccept}
+      onRegenerate={handleRegenerate}
+      onDiscard={handleDiscard}
+      onDownload={handleDownload}
+      loading={loading}
+    />
+  ) : undefined
+
+  // Parallax mode: the studio's "edit target" is the active layer's image.
+  // We compute the display image / dimensions for the active layer (or the
+  // current candidate when reviewing) so the rest of the render can stay
+  // mode-agnostic where possible.
+  const parallaxActiveImage = isParallax
+    ? activeCandidate?.imageUrl ?? activeLayer?.imageUrl ?? null
+    : null
+  const parallaxActiveDims = isParallax
+    ? activeCandidate
+      ? candidateDims[selectedCandidateIdx] ??
+        (activeLayer && activeLayer.width && activeLayer.height
+          ? { width: activeLayer.width, height: activeLayer.height }
+          : null)
+      : activeLayer && activeLayer.width && activeLayer.height
+        ? { width: activeLayer.width, height: activeLayer.height }
+        : null
+    : null
+
+  // Whether ANY layer in parallax mode has been populated. Drives the TopBar
+  // "New image" affordance — there's no point offering to discard if the
+  // project is already empty.
+  const hasAnyParallaxImage = parallaxLayers.some((l) => !!l.imageUrl)
+  const hasAnchorLayer = parallaxLayers.some(
+    (l) => l.role === WORKFLOW_ORDER[0] && !!l.imageUrl
+  )
+  const showSceneDirection =
+    isParallax &&
+    (hasAnchorLayer || !!sceneBrief.trim() || sceneBriefLoading)
+
   return (
     <main className="relative flex min-h-screen flex-col">
       <TopBar
-        hasImage={!!selectedImage}
+        hasImage={
+          isParallax
+            ? hasAnyParallaxImage
+            : isTile
+              ? tileSet.some((s) => s.hasImage)
+              : isProps
+                ? propItems.some((p) => !!p.imageUrl)
+                : isSprite
+                  ? spriteSheet.frames.some((f) => !!f.imageUrl)
+                  : !!selectedImage
+        }
+        mode={mode}
+        setMode={setMode}
         onNewImage={handleNewImage}
         onShowSettings={() => setShowSettings(true)}
       />
 
-      {!displayImage ? (
-        <EmptyState
+      {isProps ? (
+        <PropStudio
+          items={propItems}
+          batchSize={PROP_BATCH}
+          prompt={propPrompt}
+          setPrompt={setPropPrompt}
+          artStyle={artStyle}
+          setArtStyle={setArtStyle}
+          generating={propSetGenerating}
+          progressMessage={propProgressMsg}
+          sceneBrief={sceneBrief}
+          setSceneBrief={setSceneBrief}
+          sceneBriefLoading={sceneBriefLoading}
+          onAddMore={handleAddPropBatch}
+          onStop={handleStopPropSet}
+          onRegenerate={handleRegenerateProp}
+          onDelete={handleDeleteProp}
+          onClearAll={handleClearPropSet}
+          onDownloadSheet={handleDownloadPropSheet}
+          onDownloadZip={handleDownloadPropZip}
+        />
+      ) : isSprite ? (
+        <SpriteStudio
+          sheet={spriteSheet}
+          anchor={spriteAnchor}
+          selectedAnim={spriteAnim}
+          setSelectedAnim={handleSelectSpriteAnim}
+          generatedAnims={spriteGeneratedAnims}
+          prompt={spritePrompt}
+          setPrompt={setSpritePrompt}
+          fps={spriteFps}
+          setFps={setSpriteFps}
+          artStyle={artStyle}
+          setArtStyle={setArtStyle}
+          generating={spriteGenerating}
+          progressMessage={spriteProgressMsg}
+          onGenerate={() => handleGenerateSpriteSheet()}
+          onRerollCharacter={handleRerollSpriteCharacter}
+          onUploadCharacter={handleUploadSpriteCharacter}
+          onRemoveUploadedCharacter={handleRemoveUploadedCharacter}
+          onStop={handleStopSpriteSheet}
+          onClear={handleClearSpriteSheet}
+          onDownloadSheet={handleDownloadSpriteSheet}
+          onDownloadZip={handleDownloadSpriteZip}
+          onToggleFrame={handleToggleSpriteFrame}
+        />
+      ) : isTile ? (
+        <TileStudio
+          tileSet={tileSet}
+          prompt={tilePrompt}
+          setPrompt={setTilePrompt}
+          artStyle={artStyle}
+          setArtStyle={setArtStyle}
+          generating={tileSetGenerating}
+          progressMessage={tileProgressMsg}
+          sceneBrief={sceneBrief}
+          setSceneBrief={setSceneBrief}
+          sceneBriefLoading={sceneBriefLoading}
+          onGenerateAll={handleGenerateTileSet}
+          onStop={handleStopTileSet}
+          onRegenerate={handleRegenerateTile}
+          onClearAll={handleClearTileSet}
+          onDownloadSheet={handleDownloadTileSheet}
+          onDownloadZip={handleDownloadTileSetZip}
+        />
+      ) : isParallax ? (
+        <ParallaxStudio
+          layers={parallaxLayers}
+          activeIdx={parallaxActiveIdx}
+          setActiveIdx={setParallaxActiveIdx}
+          onClearLayer={clearLayer}
+          onScrollSpeedChange={setLayerScrollSpeed}
+          activeImage={parallaxActiveImage}
+          activeDimensions={parallaxActiveDims}
+          onExtend={(d) => handleExtend(d)}
+          activeDirection={activeDirection}
+          loading={loading}
+          progressMessage={progressMsg}
+          isResult={isResult}
+          resultMessage={
+            isResult
+              ? variantCount > 1
+                ? `Cycle variants with ← →, then accept`
+                : 'New extension ready — accept, regenerate, or discard'
+              : undefined
+          }
+          variantSelector={variantSelectorEl}
+          resultActions={resultActionsEl}
+          targetWidth={parallaxTargetWidth}
+          setTargetWidth={setParallaxTargetWidth}
+          onAutoExtend={handleAutoExtend}
+          onStopAutoExtend={handleStopAutoExtend}
+          autoExtending={parallaxAutoExtending}
+          onMakeTileable={handleMakeActiveLayerTileable}
+          onHarmonize={handleHarmonizeActiveLayer}
+          onDownloadActiveLayerPng={handleDownloadFull}
+          onExportZip={handleExportZip}
           onPickFile={() => fileInputRef.current?.click()}
-          onGenerate={() => setShowGenerateModal(true)}
+          onGenerate={openGenerateModal}
+          onDropFile={handleFile}
+        />
+      ) : !displayImage ? (
+        <EmptyState
+          mode={mode}
+          onPickFile={() => fileInputRef.current?.click()}
+          onGenerate={openGenerateModal}
           onDropFile={handleFile}
         />
       ) : (
@@ -2108,46 +3862,42 @@ export default function Home() {
                 : 'New extension ready — accept, regenerate, or discard'
               : undefined
           }
-          variantSelector={
-            isResult && variantCount > 1 ? (
-              <VariantSelector
-                index={selectedCandidateIdx}
-                total={variantCount}
-                isBest={selectedCandidateIdx === 0}
-                score={debugMode ? activeCandidate?.score : undefined}
-                onPrev={() => cycleVariant(-1)}
-                onNext={() => cycleVariant(1)}
-              />
-            ) : undefined
-          }
-          resultActions={
-            isResult ? (
-              <ResultActions
-                onAccept={handleAccept}
-                onRegenerate={handleRegenerate}
-                onDiscard={handleDiscard}
-                onDownload={handleDownload}
-                loading={loading}
-              />
-            ) : undefined
-          }
+          variantSelector={variantSelectorEl}
+          resultActions={resultActionsEl}
         />
       )}
 
-      {selectedImage && !isResult && (
-        <CommandBar
-          prompt={customPrompt}
-          setPrompt={setCustomPrompt}
-          artStyle={artStyle}
-          setArtStyle={setArtStyle}
-          loading={loading}
-          hint={
-            artStyle !== 'none'
-              ? `Style: ${findStyleLabel(artStyle)} — describe what to add (optional)`
-              : undefined
-          }
-        />
-      )}
+      {/* Command bar: extender mode shows it once an image exists; parallax
+          mode shows it whenever the active layer has an image so users can
+          tweak the prompt while iterating. Tile, Props, and Sprite modes have
+          their own action bars built into the studio. */}
+      {!isTile &&
+        !isSprite &&
+        !isProps &&
+        ((isParallax && !!activeLayer?.imageUrl) ||
+          (!isParallax && !!selectedImage)) &&
+        !isResult &&
+        !parallaxAutoExtending && (
+          <CommandBar
+            prompt={customPrompt}
+            setPrompt={setCustomPrompt}
+            artStyle={artStyle}
+            setArtStyle={setArtStyle}
+            loading={loading}
+            hint={
+              isParallax
+                ? artStyle !== 'none'
+                  ? `Style: ${findStyleLabel(artStyle)} — describe what to extend in the ${LAYER_ROLES[activeLayer!.role].short.toLowerCase()} layer`
+                  : `Optional: describe what should appear further along the ${LAYER_ROLES[activeLayer!.role].short.toLowerCase()} layer…`
+                : artStyle !== 'none'
+                  ? `Style: ${findStyleLabel(artStyle)} — describe what to add (optional)`
+                  : undefined
+            }
+            sceneBrief={showSceneDirection ? sceneBrief : undefined}
+            setSceneBrief={showSceneDirection ? setSceneBrief : undefined}
+            sceneBriefLoading={sceneBriefLoading}
+          />
+        )}
 
       {/* Hidden file input */}
       <input
@@ -2163,7 +3913,7 @@ export default function Home() {
         onClose={() => setShowSettings(false)}
         debugMode={debugMode}
         setDebugMode={setDebugMode}
-        onGenerate={() => setShowGenerateModal(true)}
+        onGenerate={openGenerateModal}
         apiKey={apiKey}
         onEditApiKey={handleEditApiKey}
         onClearApiKey={handleClearApiKey}
@@ -2193,6 +3943,31 @@ export default function Home() {
         setArtStyle={setArtStyle}
         generating={generating}
         onGenerate={handleGenerateImage}
+        workflowNote={
+          mode === 'parallax' && activeLayer && !activeLayer.imageUrl
+            ? (() => {
+                const prereq = getWorkflowPrerequisite(
+                  parallaxLayers,
+                  activeLayer.role
+                )
+                if (!prereq) return null
+                return `Tip: ${LAYER_ROLES[prereq.role].label} isn't built yet. Layers work best when generated front-to-back (Near → Mid → Far → Sky) so palette and art direction stay consistent. You can still generate now if you're bringing your own matching assets.`
+              })()
+            : null
+        }
+        showSceneBrief={
+          mode === 'parallax' &&
+          !!activeLayer &&
+          activeLayer.role !== WORKFLOW_ORDER[0]
+        }
+        sceneBrief={sceneBrief}
+        setSceneBrief={setSceneBrief}
+        sceneBriefLoading={sceneBriefLoading}
+        layerLabel={
+          mode === 'parallax' && activeLayer
+            ? LAYER_ROLES[activeLayer.role].short
+            : undefined
+        }
       />
 
       {error && <ErrorToast message={error} onClose={() => setError(null)} />}

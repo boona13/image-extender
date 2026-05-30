@@ -289,6 +289,40 @@ textarea::placeholder {
   background: linear-gradient(to left, var(--accent-bg), transparent 60%);
 }
 
+/* Parallax preview speed slider — thin track, accent thumb, dark-friendly */
+.parallax-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 90px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface);
+  outline: none;
+  cursor: pointer;
+}
+.parallax-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+  transition: transform 100ms ease;
+}
+.parallax-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.parallax-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+
 /* Checkered transparency pattern (subtle) — shows when image has alpha */
 .checker {
   background-image:
