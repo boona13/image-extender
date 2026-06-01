@@ -5,12 +5,12 @@
 > decoration props) from the same studio.
 
 A small open-source web app for AI outpainting **and** 2D game-art generation.
-Powered by Google's Gemini image models via [OpenRouter](https://openrouter.ai),
-with a Poisson-blending pipeline that hides the seam between original and
+It defaults to Google's Gemini image models via [OpenRouter](https://openrouter.ai),
+but Settings can route Image / Text / Vision workloads to different custom
+providers. The Poisson-blending pipeline hides the seam between original and
 AI-generated pixels, plus purpose-built pipelines for tiles, sprites, and props.
 
-Bring your own OpenRouter API key — it stays in your browser, never on the
-server.
+Bring your own provider API key — it stays in your browser, never on the server.
 
 ![A 1024² portrait shot extended into a cinematic wide-angle scene with no visible seam](docs/screenshots/after.png)
 
@@ -81,12 +81,12 @@ in the top bar:
   rising on the horizon"*.
 - **Custom art styles.** 40+ styles from cinematic and oil painting to
   Studio Ghibli, cyberpunk, vaporwave, etc.
-- **BYOK (Bring Your Own Key).** Your OpenRouter key is stored only in your
-  browser's `localStorage`. The server proxies your requests to OpenRouter
-  but never logs or persists the key.
-- **Model picker.** Switch between Gemini 3 Pro Image (Nano Banana Pro),
-  Gemini 3 Flash Image (Nano Banana 2), and Gemini 2.5 Flash Image (Nano
-  Banana) from Settings — each with tuned best-of-N and timing.
+- **BYOK (Bring Your Own Key).** Provider keys are stored only in your
+  browser's `localStorage`. The server proxies requests to the configured
+  provider but never logs or persists the key.
+- **Model + provider picker.** Switch default OpenRouter models from Settings,
+  or configure separate Image / Text / Vision providers with their own base
+  URLs, API keys, protocols, and models.
 - **Keyboard-first.** Arrow keys to extend, `←`/`→` to cycle variants,
   `Enter` to accept, `R` to regenerate, `Esc` to discard.
 - **Generate from scratch.** Don't have a base image? Generate one with a
@@ -349,11 +349,12 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). On first load the app
-will prompt for your OpenRouter API key — paste it once, it's stored locally,
+will prompt for a default provider API key — paste it once, it's stored locally,
 you'll never see the prompt again unless you clear it from Settings.
 
-Get a key at [openrouter.ai/keys](https://openrouter.ai/keys). It costs
-about **$0.03 per Gemini extension** (Nano Banana 2 Flash Image).
+The default OpenRouter path still works with keys from
+[openrouter.ai/keys](https://openrouter.ai/keys); custom providers can be
+configured in Settings or through environment variables.
 
 ### Optional: server-side env fallback
 
@@ -363,11 +364,46 @@ where you want to provide the key for visitors), copy `.env.example` to
 
 ```bash
 cp .env.example .env.local
-# edit .env.local and add your OPENROUTER_API_KEY
+# edit .env.local and add OPENROUTER_API_KEY or per-provider keys
 ```
 
 When set, the server will use this key for any request that doesn't
 include a client-provided one.
+
+### Custom providers
+
+Settings exposes three independent provider slots:
+
+- **Image provider** — used by Extender, Parallax, Tiles, Sprites, and Props
+  rendering calls.
+- **Text provider** — used by scene briefs and prop ideation.
+- **Vision provider** — used by tile and sprite QA review passes.
+
+Each slot can use a different protocol, base URL, key, and model. The default
+protocol is `openrouter-chat-completions`, which keeps the original Nano Banana
+/ Gemini behavior. `openai-responses` is available for providers that return
+images through Responses-style `image_generation_call` output, while
+`openai-chat-completions` covers OpenAI-compatible text and vision gateways.
+`openai-images` is available for pure text-to-image generation.
+
+Server-side environment variables can also be configured per ability:
+
+```bash
+IMAGE_PROVIDER_PROTOCOL=openai-responses
+IMAGE_PROVIDER_BASE_URL=https://api.openai.com/v1
+IMAGE_PROVIDER_API_KEY=...
+IMAGE_PROVIDER_MODEL=gpt-image-2
+
+TEXT_PROVIDER_PROTOCOL=openai-chat-completions
+TEXT_PROVIDER_BASE_URL=https://openrouter.ai/api/v1
+TEXT_PROVIDER_API_KEY=...
+TEXT_PROVIDER_MODEL=google/gemini-2.0-flash-001
+
+VISION_PROVIDER_PROTOCOL=openai-chat-completions
+VISION_PROVIDER_BASE_URL=https://openrouter.ai/api/v1
+VISION_PROVIDER_API_KEY=...
+VISION_PROVIDER_MODEL=google/gemini-2.0-flash-001
+```
 
 ## Usage
 
@@ -406,7 +442,7 @@ Optional custom prompt and art style live in the bottom command bar.
 - **HTML Canvas** for all client-side image manipulation
   ([app/utils/imageProcessor.ts](app/utils/imageProcessor.ts))
 - **[JSZip](https://stuk.github.io/jszip/)** for in-browser project bundling
-- **[OpenRouter](https://openrouter.ai)** for model access
+- **Provider adapters** for model access. OpenRouter remains the default.
   - Image: `google/gemini-3.1-flash-image-preview` (Nano Banana 2, default),
     `google/gemini-3-pro-image-preview` (Nano Banana Pro),
     `google/gemini-2.5-flash-image` (Nano Banana), and
@@ -419,7 +455,7 @@ Optional custom prompt and art style live in the bottom command bar.
 ```
 app/
 ├── api/
-│   ├── extend/route.ts        Outpainting endpoint (proxies OpenRouter)
+│   ├── extend/route.ts        Outpainting endpoint (provider-backed)
 │   ├── generate/route.ts      Text-to-image + tile-sheet + sprite-sheet prompts
 │   ├── scene-brief/route.ts   Distill a shared scene brief for a project
 │   ├── prop-brief/route.ts    Props "art director" — invents the next prop batch
@@ -433,6 +469,7 @@ app/
 │   └── PropStudio.tsx
 ├── lib/                       Domain logic & constants
 │   ├── app.ts / models.ts / artStyles.ts
+│   ├── providers/             Provider config + OpenRouter/OpenAI-compatible adapters
 │   ├── parallax.ts / tileset.ts / sprite.ts / props.ts
 │   └── bodyPlans.ts           Sprite body-plan registry (anims, presets, rigs)
 ├── utils/
@@ -464,12 +501,13 @@ A few small values you might want to tune:
 
 ## Privacy & security
 
-- The OpenRouter API key entered in the UI is stored **only** in your
-  browser's `localStorage`. It is never written to the server's disk and
-  never logged. The server uses it once per request to proxy the call to
-  OpenRouter, then discards it.
+- Provider API keys entered in the UI are stored **only** in your browser's
+  `localStorage`. They are never written to the server's disk and never logged.
+  The server uses them once per request to proxy the call to the configured
+  provider, then discards them.
 - The server-side `OPENROUTER_API_KEY` env var is **optional** and acts only
-  as a fallback for requests that don't include a client-provided key.
+  as a fallback for requests that don't include a client-provided key. Per-slot
+  provider env vars can override it.
 - No analytics, no telemetry, no tracking.
 
 ## Acknowledgments

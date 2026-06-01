@@ -38,7 +38,7 @@ export type Candidate = {
 export const EXTENSION_PERCENT = 38
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenRouter integration — BYOK (bring your own key) for open-source friendliness
+// Provider integration — BYOK（自带 key）并支持按能力配置自定义 provider。
 // ─────────────────────────────────────────────────────────────────────────────
 
 

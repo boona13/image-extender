@@ -1,4 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
+import {
+  ProviderHttpError,
+  assertProviderReady,
+  callTextProvider,
+  resolveProvider,
+} from '@/app/lib/providers/server'
 
 // ART DIRECTOR — call #1 of the two-call props pipeline.
 //
@@ -97,27 +103,28 @@ function parseIdeas(raw: string): PropIdea[] {
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, sceneBrief, artStyle, apiKey, model, count, existing } =
+    const { prompt, sceneBrief, artStyle, apiKey, model, count, existing, providerSettings } =
       await request.json()
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       return NextResponse.json({ error: 'Missing biome prompt' }, { status: 400 })
     }
 
-    const openRouterKey =
-      typeof apiKey === 'string' && apiKey.trim()
-        ? apiKey.trim()
-        : process.env.OPENROUTER_API_KEY
-
-    if (!openRouterKey) {
+    // 道具创意规划是纯文本任务，使用 text provider。
+    const provider = resolveProvider({
+      capability: 'text',
+      providerSettings,
+      legacyApiKey: apiKey,
+      legacyModel: model,
+      defaultModel: DEFAULT_MODEL,
+    })
+    const providerProblem = assertProviderReady(provider)
+    if (providerProblem) {
       return NextResponse.json(
-        { error: 'OpenRouter API key missing. Add one in Settings.' },
-        { status: 401 }
+        { error: providerProblem.message },
+        { status: providerProblem.status }
       )
     }
-
-    const modelId =
-      typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_MODEL
 
     const n = Math.max(1, Math.min(24, Math.round(Number(count) || 8)))
     const existingList: string[] = Array.isArray(existing)
@@ -157,45 +164,19 @@ Output STRICT JSON only — no prose, no markdown fences. Schema:
 
 Propose ${n} brand-new decoration props as strict JSON.`
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openRouterKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': request.headers.get('referer') || 'http://localhost:3000',
-        'X-Title': 'AI Image Extender - Prop Art Director',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        max_tokens: 900,
-        // High temperature: this is the CREATIVE step. We want it reaching for
-        // novel kinds, not playing it safe.
+    const raw = await callTextProvider(
+      provider,
+      {
+        capability: 'text',
+        systemPrompt,
+        userContent: userPrompt,
+        maxTokens: 900,
+        // 创意规划需要更高温度，避免重复生成相同道具类别。
         temperature: 1.0,
-      }),
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.error?.message || 'Failed to generate prop brief' },
-        { status: response.status }
-      )
-    }
-
-    const data = await response.json()
-    const content = data.choices?.[0]?.message?.content
-    const raw =
-      typeof content === 'string'
-        ? content
-        : Array.isArray(content)
-          ? content
-              .map((p: { text?: string }) => (typeof p?.text === 'string' ? p.text : ''))
-              .join('')
-          : ''
+        title: 'AI Image Extender - Prop Art Director',
+      },
+      { referer: request.headers.get('referer') }
+    )
 
     const ideas = parseIdeas(raw).slice(0, n)
     if (ideas.length === 0) {
@@ -208,6 +189,9 @@ Propose ${n} brand-new decoration props as strict JSON.`
     return NextResponse.json({ ideas })
   } catch (error) {
     console.error('Error in prop-brief route:', error)
+    if (error instanceof ProviderHttpError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },
       { status: 500 }

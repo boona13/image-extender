@@ -14,6 +14,7 @@ import { Workspace } from '@/app/components/Workspace'
 import { Candidate, Direction, EXTENSION_PERCENT, Mode, STORAGE_KEY, STORAGE_MODE, STORAGE_MODEL } from '@/app/lib/app'
 import { findStyleLabel } from '@/app/lib/artStyles'
 import { DEFAULT_MODEL, MODELS, getModelConfig, skipsArtDirectorReview } from '@/app/lib/models'
+import { PROVIDER_STORAGE_KEY, ProviderSettings, createDefaultProviderSettings, normalizeProviderSettings } from '@/app/lib/providers/types'
 import { LAYER_ORDER, LAYER_ROLES, LayerRole, PARALLAX_MAX_AUTO_STEPS, ParallaxLayer, WORKFLOW_ORDER, createDefaultLayers, getRecommendedLayerIndex, getWorkflowPrerequisite } from '@/app/lib/parallax'
 import { PROP_BATCH, PROP_BATCH_COLS, PROP_BATCH_H, PROP_BATCH_ROWS, PROP_BATCH_W, PROP_TILE_SIZE, PropItem, nextPropId, propAtlasLayout, resolvePropNames } from '@/app/lib/props'
 import { SPRITE_ANIMATIONS, SPRITE_FRAME_COUNT, SPRITE_FRAME_SIZE, SPRITE_GRID_COLS, SPRITE_GRID_ROWS, SPRITE_SHEET_H, SPRITE_SHEET_W, SPRITE_STRIP_H, SPRITE_STRIP_W, SpriteAnimType, SpriteFrame, SpriteSheet, createEmptySpriteSheet } from '@/app/lib/sprite'
@@ -192,7 +193,10 @@ export default function Home() {
   // "hydrating" state so we don't flash the modal before reading storage.
   const [apiKey, setApiKey] = useState('')
   const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL)
-  const skipArtDirectorReview = skipsArtDirectorReview(selectedModel)
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings>(() =>
+    createDefaultProviderSettings(DEFAULT_MODEL)
+  )
+  const skipArtDirectorReview = skipsArtDirectorReview(providerSettings.image.model || selectedModel)
   const [hydrated, setHydrated] = useState(false)
   const [showApiKeyModal, setShowApiKeyModal] = useState(false)
   // Required-mode means the user can't dismiss the modal (first run, no key
@@ -207,7 +211,11 @@ export default function Home() {
       const k = localStorage.getItem(STORAGE_KEY) || ''
       const m = localStorage.getItem(STORAGE_MODEL) || ''
       const savedMode = localStorage.getItem(STORAGE_MODE) || ''
+      const rawProviders = localStorage.getItem(PROVIDER_STORAGE_KEY)
+      const parsedProviders = rawProviders ? JSON.parse(rawProviders) : null
+      const normalizedProviders = normalizeProviderSettings(parsedProviders, DEFAULT_MODEL)
       setApiKey(k)
+      setProviderSettings(normalizedProviders)
       if (m && MODELS.some((mm) => mm.value === m)) {
         setSelectedModel(m)
       }
@@ -220,7 +228,10 @@ export default function Home() {
       ) {
         setModeState(savedMode)
       }
-      if (!k) {
+      // 若默认 key 和三类 provider 专属 key 都为空，则首次打开时提示用户；
+      // 仍然允许用户选择“Use server env”来使用服务端环境变量。
+      const hasProviderKey = Object.values(normalizedProviders).some((provider) => provider.apiKey.trim())
+      if (!k && !hasProviderKey) {
         setApiKeyRequired(true)
         setShowApiKeyModal(true)
       }
@@ -257,6 +268,13 @@ export default function Home() {
     } catch {}
   }, [selectedModel, hydrated])
 
+  useEffect(() => {
+    if (!hydrated) return
+    try {
+      localStorage.setItem(PROVIDER_STORAGE_KEY, JSON.stringify(providerSettings))
+    } catch {}
+  }, [providerSettings, hydrated])
+
   const handleSaveApiKey = (key: string) => {
     setApiKey(key)
     setShowApiKeyModal(false)
@@ -287,6 +305,13 @@ export default function Home() {
     }
     return true
   }
+
+  /** 所有 AI API 请求都带上统一 provider 配置；旧 apiKey/model 字段保留为回退。 */
+  const aiRequestConfig = () => ({
+    apiKey: apiKey || undefined,
+    model: selectedModel,
+    providerSettings,
+  })
 
   // ── Parallax layer helpers ─────────────────────────────────────────────────
 
@@ -519,8 +544,7 @@ export default function Home() {
           body: JSON.stringify({
             anchorPrompt: anchorPrompt.trim(),
             artStyle: artStyle !== 'none' ? artStyle : undefined,
-            apiKey: apiKey || undefined,
-            model: selectedModel,
+            ...aiRequestConfig(),
           }),
         })
         const data = await response.json()
@@ -537,7 +561,7 @@ export default function Home() {
         setSceneBriefLoading(false)
       }
     },
-    [apiKey, artStyle, selectedModel]
+    [apiKey, artStyle, selectedModel, providerSettings]
   )
 
   const handleGenerateImage = async () => {
@@ -559,8 +583,7 @@ export default function Home() {
           width: generateWidth,
           height: generateHeight,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
+          ...aiRequestConfig(),
           layerRole,
           sceneBrief:
             mode === 'parallax' &&
@@ -636,8 +659,7 @@ export default function Home() {
             extensionAmount: EXTENSION_PERCENT,
             customPrompt: promptText.trim() || undefined,
             artStyle: style !== 'none' ? style : undefined,
-            apiKey: apiKey || undefined,
-            model: selectedModel,
+            ...aiRequestConfig(),
             layerRole,
             sceneBrief:
               mode === 'parallax' && sceneBrief.trim()
@@ -670,7 +692,7 @@ export default function Home() {
       }
 
       const isHorizontal = direction === 'left' || direction === 'right'
-      const modelCfg = getModelConfig(selectedModel)
+      const modelCfg = getModelConfig(providerSettings.image.model || selectedModel)
 
       if (isHorizontal) {
         const maxAttempts = Math.max(1, modelCfg.maxAttempts)
@@ -762,7 +784,7 @@ export default function Home() {
         }
       }
     },
-    [currentImageDimensions, debugMode, apiKey, selectedModel, mode, sceneBrief]
+    [currentImageDimensions, debugMode, apiKey, selectedModel, providerSettings, mode, sceneBrief]
   )
 
   /**
@@ -1092,8 +1114,7 @@ export default function Home() {
           width: TILESET_TILE_SIZE,
           height: TILESET_TILE_SIZE,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
+          ...aiRequestConfig(),
           tileMode: true,
           tileRole: role,
           sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
@@ -1291,7 +1312,7 @@ export default function Home() {
         body: JSON.stringify({
           prompt: tilePrompt,
           sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
-          apiKey: apiKey || undefined,
+          ...aiRequestConfig(),
           previewImage,
           sheetImage: sheetImage || undefined,
         }),
@@ -1347,8 +1368,7 @@ export default function Home() {
           width: TILE_TEMPLATE_W,
           height: TILE_TEMPLATE_H,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
+          ...aiRequestConfig(),
           tileSheet: true,
           tileGuideImage,
           tileFixNotes: fixNotes,
@@ -1910,7 +1930,7 @@ export default function Home() {
           prompt: propPrompt,
           sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
+          ...aiRequestConfig(),
           count,
           existing: propCategoriesOf(items),
         }),
@@ -2042,8 +2062,7 @@ export default function Home() {
           width: PROP_BATCH_W,
           height: PROP_BATCH_H,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
+          ...aiRequestConfig(),
           propSheet: true,
           propCols: PROP_BATCH_COLS,
           propRows: PROP_BATCH_ROWS,
@@ -2166,8 +2185,7 @@ export default function Home() {
           width: PROP_TILE_SIZE,
           height: PROP_TILE_SIZE,
           artStyle: artStyle !== 'none' ? artStyle : undefined,
-          apiKey: apiKey || undefined,
-          model: selectedModel,
+          ...aiRequestConfig(),
           propMode: true,
           propRole: idea?.description,
           propRefImage: refImage,
@@ -2347,8 +2365,7 @@ export default function Home() {
         width: SPRITE_FRAME_SIZE,
         height: SPRITE_FRAME_SIZE,
         artStyle: artStyle !== 'none' ? artStyle : undefined,
-        apiKey: apiKey || undefined,
-        model: selectedModel,
+        ...aiRequestConfig(),
         spriteAnchor: true,
         spriteBodyPlan,
         sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
@@ -2408,8 +2425,7 @@ export default function Home() {
         width: SPRITE_SHEET_W,
         height: SPRITE_SHEET_H,
         artStyle: artStyle !== 'none' ? artStyle : undefined,
-        apiKey: apiKey || undefined,
-        model: selectedModel,
+        ...aiRequestConfig(),
         spriteSheet: true,
         spriteAnim,
         spriteBodyPlan,
@@ -2562,7 +2578,7 @@ export default function Home() {
           anim: spriteAnim,
           bodyPlan: spriteBodyPlan,
           sceneBrief: sceneBrief.trim() ? sceneBrief.trim() : undefined,
-          apiKey: apiKey || undefined,
+          ...aiRequestConfig(),
           sheetImage,
           anchorImage: anchorImage || undefined,
         }),
@@ -4011,6 +4027,8 @@ export default function Home() {
         onClearApiKey={handleClearApiKey}
         selectedModel={selectedModel}
         setSelectedModel={setSelectedModel}
+        providerSettings={providerSettings}
+        setProviderSettings={setProviderSettings}
       />
 
       <ApiKeyModal

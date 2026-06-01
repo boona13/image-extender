@@ -1,35 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
+import {
+  ProviderHttpError,
+  assertProviderReady,
+  callImageProvider,
+  resolveProvider,
+} from '@/app/lib/providers/server'
 
 const DEFAULT_MODEL = 'google/gemini-3.1-flash-image-preview'
-
-const SUPPORTED_IMAGE_ASPECT_RATIOS = [
-  '1:1',
-  '2:3',
-  '3:2',
-  '3:4',
-  '4:3',
-  '4:5',
-  '5:4',
-  '9:16',
-  '16:9',
-  '21:9',
-] as const
-
-function aspectRatioValue(ratio: string): number {
-  const [w, h] = ratio.split(':').map(Number)
-  return w / h
-}
-
-function supportedAspectRatioForSize(width: number, height: number): string {
-  const target = width / height
-  return SUPPORTED_IMAGE_ASPECT_RATIOS
-    .map((ratio) => ({
-      ratio,
-      // Compare in log space so 2:1 and 1:2 errors are symmetric.
-      error: Math.abs(Math.log(aspectRatioValue(ratio) / target)),
-    }))
-    .sort((a, b) => a.error - b.error)[0].ratio
-}
 
 export async function POST(request: NextRequest) {
   try {
@@ -68,6 +45,7 @@ export async function POST(request: NextRequest) {
       propCount,
       propRefImage,
       propAvoidHint,
+      providerSettings,
     } = await request.json()
 
     if (!prompt || !width || !height) {
@@ -77,18 +55,22 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const openRouterKey = (typeof apiKey === 'string' && apiKey.trim())
-      ? apiKey.trim()
-      : process.env.OPENROUTER_API_KEY
-
-    if (!openRouterKey) {
+    // 生成类工作流统一走 image provider；旧的 apiKey/model 字段继续作为回退，
+    // 这样未配置自定义 provider 的用户仍然保持原 OpenRouter 行为。
+    const provider = resolveProvider({
+      capability: 'image',
+      providerSettings,
+      legacyApiKey: apiKey,
+      legacyModel: model,
+      defaultModel: DEFAULT_MODEL,
+    })
+    const providerProblem = assertProviderReady(provider)
+    if (providerProblem) {
       return NextResponse.json(
-        { error: 'OpenRouter API key missing. Add one in Settings.' },
-        { status: 401 }
+        { error: providerProblem.message },
+        { status: providerProblem.status }
       )
     }
-
-    const modelId = (typeof model === 'string' && model.trim()) ? model.trim() : DEFAULT_MODEL
 
     // Art style descriptions
     const artStyleDescriptions: { [key: string]: string } = {
@@ -1202,37 +1184,19 @@ ${
       text: fullPrompt,
     })
 
-    // Call OpenRouter API with image generation model
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openRouterKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': request.headers.get('referer') || 'http://localhost:3000',
-        'X-Title': 'AI Image Extender - Generator',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          {
-            role: 'user',
-            content: messageContent,
-          },
-        ],
-        modalities: ['image', 'text'],
-        // GPT image models are especially literal about the requested canvas
-        // aspect. If omitted, OpenRouter/model defaults can come back square;
-        // the client then normalizes that square into e.g. a 2048×1024 sprite
-        // sheet, visually stretching every frame. Always send the intended
-        // reduced aspect ratio (sprites are 2:1, square anchors are 1:1).
-        image_config: { aspect_ratio: supportedAspectRatioForSize(width, height) },
-        max_tokens: 2000,
-        // Low temperature on multi-cell sheet generation keeps the model
-        // disciplined about the grid layout + per-cell consistency.
-        // Sprite sheets need even lower temperature than tile sheets —
-        // 8 keyframes of the SAME character on one canvas amplifies any
-        // appearance drift between cells (flicker). 0.2 is the value
-        // most 2026 sprite-AI pipelines converged on.
+    // 只把图片输入交给 provider；文本 prompt 始终使用前面整理好的 fullPrompt，
+    // 避免 Responses 与 Chat 两种协议的 content 格式差异泄漏到业务流程。
+    const inputImages = messageContent
+      .map((part: any) => part?.image_url?.url)
+      .filter((url: unknown): url is string => typeof url === 'string' && url.startsWith('data:image/'))
+    const result = await callImageProvider(
+      provider,
+      {
+        prompt: fullPrompt,
+        inputImages,
+        width,
+        height,
+        maxTokens: 2000,
         temperature:
           spriteSheet === true
             ? 0.2
@@ -1241,103 +1205,20 @@ ${
               : propSheet === true
                 ? 0.6
                 : 0.7,
-      }),
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json()
-      console.error('OpenRouter API error:', errorData)
-      return NextResponse.json(
-        { error: errorData.error?.message || 'Failed to generate image' },
-        { status: response.status }
-      )
-    }
-
-    const data = await response.json()
-    const message = data.choices?.[0]?.message
-    
-    if (!message) {
-      return NextResponse.json(
-        { error: 'No message in response' },
-        { status: 500 }
-      )
-    }
-
-    // Extract image from response (same logic as extend route)
-    let imageUrl = null
-    
-    // Check if images array exists (Gemini 2.5 Flash format)
-    if (message.images && Array.isArray(message.images) && message.images.length > 0) {
-      const firstImage = message.images[0]
-      if (firstImage.image_url?.url) {
-        imageUrl = firstImage.image_url.url
-      }
-    }
-    
-    // If no image found in images array, check content
-    if (!imageUrl) {
-      const content = message.content
-      
-      if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part.type === 'image_url' && part.image_url?.url) {
-            imageUrl = part.image_url.url
-            break
-          }
-          if (part.type === 'image' && part.url) {
-            imageUrl = part.url
-            break
-          }
-          if (part.image_url?.data) {
-            imageUrl = `data:image/png;base64,${part.image_url.data}`
-            break
-          }
-          if (part.data) {
-            imageUrl = `data:image/png;base64,${part.data}`
-            break
-          }
-          if (part.inline_data?.data) {
-            const mimeType = part.inline_data.mime_type || 'image/png'
-            imageUrl = `data:${mimeType};base64,${part.inline_data.data}`
-            break
-          }
-        }
-      } else if (typeof content === 'string') {
-        if (content.startsWith('data:image') || content.startsWith('http')) {
-          imageUrl = content
-        } else if (content.length > 100 && /^[A-Za-z0-9+/=]+$/.test(content.substring(0, 100))) {
-          imageUrl = `data:image/png;base64,${content}`
-        }
-      }
-    }
-
-    if (!imageUrl) {
-      return NextResponse.json(
-        { error: 'No image generated. The model may not support pure image generation.' },
-        { status: 500 }
-      )
-    }
+        title: 'AI Image Extender - Generator',
+        forceEdit: inputImages.length > 0,
+      },
+      { referer: request.headers.get('referer') }
+    )
+    const imageUrl = result.imageUrl
 
     // For props, the model also returns a text line naming each decoration
     // ("ITEMS: a | b | c"). We parse it so the client can keep a cheap TEXT
     // de-dup list instead of shipping the whole library back as images.
     let names: string[] = []
     if (propSheet === true || propMode === true) {
-      let text = ''
-      const content = message.content
-      if (typeof content === 'string') {
-        text = content
-      } else if (Array.isArray(content)) {
-        text = content
-          .map((part: any) =>
-            typeof part === 'string'
-              ? part
-              : part?.type === 'text' && typeof part.text === 'string'
-                ? part.text
-                : ''
-          )
-          .join(' ')
-      }
+      // 不同 provider 的文本伴随输出位置不同，适配层已经规整成 result.text。
+      const text = result.text
       const m = text.match(/ITEMS?\s*:\s*(.+)/i)
       const raw = m ? m[1] : text
       names = raw
@@ -1350,10 +1231,12 @@ ${
     return NextResponse.json({ imageUrl, names })
   } catch (error) {
     console.error('Error in generate route:', error)
+    if (error instanceof ProviderHttpError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },
       { status: 500 }
     )
   }
 }
-

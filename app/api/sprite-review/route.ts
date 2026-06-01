@@ -1,4 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
+import {
+  ProviderHttpError,
+  assertProviderReady,
+  callTextProvider,
+  resolveProvider,
+} from '@/app/lib/providers/server'
 
 // QA ART DIRECTOR for sprite sheets — the review half of the sprite pipeline.
 //
@@ -152,27 +158,28 @@ function parseReview(raw: string): Review | null {
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, anim, bodyPlan, sceneBrief, apiKey, model, sheetImage, anchorImage } =
+    const { prompt, anim, bodyPlan, sceneBrief, apiKey, model, sheetImage, anchorImage, providerSettings } =
       await request.json()
 
     if (typeof sheetImage !== 'string' || !sheetImage.startsWith('data:image/')) {
       return NextResponse.json({ error: 'Missing sprite sheet image' }, { status: 400 })
     }
 
-    const openRouterKey =
-      typeof apiKey === 'string' && apiKey.trim()
-        ? apiKey.trim()
-        : process.env.OPENROUTER_API_KEY
-
-    if (!openRouterKey) {
+    // Sprite QA 需要视觉理解，使用 vision provider。
+    const provider = resolveProvider({
+      capability: 'vision',
+      providerSettings,
+      legacyApiKey: apiKey,
+      legacyModel: model,
+      defaultModel: DEFAULT_MODEL,
+    })
+    const providerProblem = assertProviderReady(provider)
+    if (providerProblem) {
       return NextResponse.json(
-        { error: 'OpenRouter API key missing. Add one in Settings.' },
-        { status: 401 }
+        { error: providerProblem.message },
+        { status: providerProblem.status }
       )
     }
-
-    const modelId =
-      typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_MODEL
 
     const planKey =
       typeof bodyPlan === 'string' && ANIM_EXPECTATION_BY_PLAN[bodyPlan]
@@ -255,43 +262,18 @@ Review the attached sprite sheet${hasAnchor ? ' against the character anchor' : 
     }
     content.push({ type: 'text', text: userText })
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${openRouterKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': request.headers.get('referer') || 'http://localhost:3000',
-        'X-Title': 'AI Image Extender - Sprite QA',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content },
-        ],
-        max_tokens: 600,
+    const text = await callTextProvider(
+      provider,
+      {
+        capability: 'vision',
+        systemPrompt,
+        userContent: content as any,
+        maxTokens: 600,
         temperature: 0.2,
-      }),
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.error?.message || 'Failed to review sprite sheet' },
-        { status: response.status }
-      )
-    }
-
-    const data = await response.json()
-    const raw = data.choices?.[0]?.message?.content
-    const text =
-      typeof raw === 'string'
-        ? raw
-        : Array.isArray(raw)
-          ? raw
-              .map((p: { text?: string }) => (typeof p?.text === 'string' ? p.text : ''))
-              .join('')
-          : ''
+        title: 'AI Image Extender - Sprite QA',
+      },
+      { referer: request.headers.get('referer') }
+    )
 
     const review = parseReview(text)
     if (!review) {
@@ -301,6 +283,9 @@ Review the attached sprite sheet${hasAnchor ? ' against the character anchor' : 
     return NextResponse.json(review)
   } catch (error) {
     console.error('Error in sprite-review route:', error)
+    if (error instanceof ProviderHttpError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },
       { status: 500 }

@@ -2,7 +2,7 @@
   "name": "image-extender",
   "version": "1.0.0",
   "private": true,
-  "description": "A web app that extends images in any direction using AI (Gemini via OpenRouter), with Poisson-blended seamless outpainting and a best-of-N variant picker.",
+  "description": "A web app that extends images in any direction using configurable AI providers, with Poisson-blended seamless outpainting and a best-of-N variant picker.",
   "keywords": [
     "ai",
     "image-extender",

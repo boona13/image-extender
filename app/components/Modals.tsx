@@ -4,6 +4,15 @@ import { useEffect, useRef, useState } from 'react'
 import { Icons } from '@/app/components/icons'
 import { ART_STYLE_GROUPS } from '@/app/lib/artStyles'
 import { MODELS, maskKey } from '@/app/lib/models'
+import {
+  PROVIDER_CAPABILITIES,
+  PROVIDER_PROTOCOLS,
+  ProviderCapability,
+  ProviderEndpointConfig,
+  ProviderSettings,
+  maskProviderSecret,
+  providerCapabilityLabel,
+} from '@/app/lib/providers/types'
 
 export function SettingsDrawer({
   open,
@@ -16,6 +25,8 @@ export function SettingsDrawer({
   onClearApiKey,
   selectedModel,
   setSelectedModel,
+  providerSettings,
+  setProviderSettings,
 }: {
   open: boolean
   onClose: () => void
@@ -27,6 +38,8 @@ export function SettingsDrawer({
   onClearApiKey: () => void
   selectedModel: string
   setSelectedModel: (v: string) => void
+  providerSettings: ProviderSettings
+  setProviderSettings: (v: ProviderSettings) => void
 }) {
   useEffect(() => {
     if (!open) return
@@ -46,7 +59,7 @@ export function SettingsDrawer({
         onClick={onClose}
       />
       <aside
-        className="fixed right-0 top-0 z-40 flex h-full w-[360px] flex-col anim-slide-up"
+        className="fixed right-0 top-0 z-40 flex h-full w-[460px] max-w-full flex-col anim-slide-up"
         style={{
           background: 'var(--bg-elev)',
           borderLeft: '1px solid var(--border-strong)',
@@ -107,7 +120,7 @@ export function SettingsDrawer({
             </div>
           </Section>
 
-          <Section title="OpenRouter key">
+          <Section title="Default key">
             {apiKey ? (
               <div
                 className="flex items-center gap-3 rounded-[var(--radius-sm)] p-3"
@@ -123,7 +136,7 @@ export function SettingsDrawer({
                   <Icons.Key size={14} />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="text-[12px] font-medium">Key saved locally</div>
+                  <div className="text-[12px] font-medium">Default key saved locally</div>
                   <div
                     className="truncate font-mono text-[11px]"
                     style={{ color: 'var(--text-muted)' }}
@@ -154,21 +167,20 @@ export function SettingsDrawer({
                 className="btn btn-secondary w-full justify-start"
               >
                 <Icons.Key size={14} />
-                Add OpenRouter key
+                Add default key
               </button>
             )}
             <p className="mt-2 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              Stored only in this browser. Get one at{' '}
-              <a
-                href="https://openrouter.ai/keys"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: 'var(--accent)' }}
-              >
-                openrouter.ai/keys
-              </a>
-              .
+              Stored only in this browser. Used as a fallback when a provider-specific key is empty.
             </p>
+          </Section>
+
+          <Section title="Providers">
+            <ProviderSettingsEditor
+              providerSettings={providerSettings}
+              onChange={setProviderSettings}
+              selectedModel={selectedModel}
+            />
           </Section>
 
           <Section title="Tools">
@@ -228,6 +240,125 @@ export function Section({ title, children }: { title: string; children: React.Re
         {title}
       </h3>
       {children}
+    </div>
+  )
+}
+
+function ProviderSettingsEditor({
+  providerSettings,
+  onChange,
+  selectedModel,
+}: {
+  providerSettings: ProviderSettings
+  onChange: (v: ProviderSettings) => void
+  selectedModel: string
+}) {
+  /** 更新单个能力的 provider 字段，保持另外两类能力配置不变。 */
+  const updateProvider = (
+    capability: ProviderCapability,
+    patch: Partial<ProviderEndpointConfig>
+  ) => {
+    onChange({
+      ...providerSettings,
+      [capability]: {
+        ...providerSettings[capability],
+        ...patch,
+      },
+    })
+  }
+
+  return (
+    <div className="space-y-5">
+      {PROVIDER_CAPABILITIES.map((capability) => {
+        const provider = providerSettings[capability]
+        const currentProtocol = PROVIDER_PROTOCOLS.find((p) => p.value === provider.protocol)
+        return (
+          <div
+            key={capability}
+            className="space-y-3 rounded-[var(--radius-sm)] p-3"
+            style={{
+              background: 'var(--surface)',
+              border: '1px solid var(--border)',
+            }}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[13px] font-semibold">
+                  {providerCapabilityLabel(capability)} provider
+                </div>
+                <div className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {currentProtocol?.description}
+                </div>
+              </div>
+              {provider.apiKey ? (
+                <code className="shrink-0 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                  {maskProviderSecret(provider.apiKey)}
+                </code>
+              ) : null}
+            </div>
+
+            <label className="block">
+              <span className="mb-1 block text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                Protocol
+              </span>
+              <select
+                value={provider.protocol}
+                onChange={(e) =>
+                  updateProvider(capability, {
+                    protocol: e.target.value as ProviderEndpointConfig['protocol'],
+                  })
+                }
+                className="field text-[12px]"
+              >
+                {PROVIDER_PROTOCOLS.map((protocol) => (
+                  <option key={protocol.value} value={protocol.value}>
+                    {protocol.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                Base URL
+              </span>
+              <input
+                value={provider.baseUrl}
+                onChange={(e) => updateProvider(capability, { baseUrl: e.target.value })}
+                placeholder="https://openrouter.ai/api/v1"
+                className="field font-mono text-[12px]"
+              />
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                Model
+              </span>
+              <input
+                value={provider.model}
+                onChange={(e) => updateProvider(capability, { model: e.target.value })}
+                placeholder={`Use selected model (${selectedModel})`}
+                className="field font-mono text-[12px]"
+              />
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                API key
+              </span>
+              <input
+                value={provider.apiKey}
+                onChange={(e) => updateProvider(capability, { apiKey: e.target.value })}
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="Leave empty to use the default key or server env"
+                className="field font-mono text-[12px]"
+              />
+            </label>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -553,7 +684,7 @@ export function ApiKeyModal({
   if (!open) return null
 
   const trimmed = value.trim()
-  const looksValid = trimmed.startsWith('sk-or-') && trimmed.length > 20
+  const looksValid = trimmed.length >= 8
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 anim-fade">
@@ -581,10 +712,10 @@ export function ApiKeyModal({
           </div>
           <div className="flex-1">
             <h2 className="text-[15px] font-semibold tracking-tight">
-              {required ? 'Add your OpenRouter key' : 'OpenRouter API key'}
+              {required ? 'Add your provider key' : 'Default provider key'}
             </h2>
             <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              Required to generate or extend images.
+              Used when a provider-specific key is empty.
             </p>
           </div>
           {!required && (
@@ -606,7 +737,7 @@ export function ApiKeyModal({
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && looksValid) onSave(trimmed)
               }}
-              placeholder="sk-or-..."
+              placeholder="API key"
               className="field pr-10 font-mono text-[13px]"
             />
             <button
@@ -625,7 +756,7 @@ export function ApiKeyModal({
               style={{ color: 'var(--danger)' }}
             >
               <Icons.AlertTriangle size={13} className="mt-0.5 shrink-0" />
-              <span>OpenRouter keys start with <code className="font-mono">sk-or-</code>.</span>
+              <span>Enter at least 8 characters, or use server env from the button below.</span>
             </div>
           )}
         </div>
@@ -639,7 +770,7 @@ export function ApiKeyModal({
           }}
         >
           Your key is stored only in this browser&apos;s <code className="font-mono">localStorage</code>.
-          It&apos;s sent with each request to your local server, which proxies it to OpenRouter — never logged, never persisted server-side.
+          It&apos;s sent with each request to your local server and then forwarded only to the configured provider — never logged, never persisted server-side.
         </div>
 
         <a
@@ -649,7 +780,7 @@ export function ApiKeyModal({
           className="mb-5 inline-flex items-center gap-1.5 text-[12px] transition-colors"
           style={{ color: 'var(--accent)' }}
         >
-          Get a key at openrouter.ai/keys
+          OpenRouter keys remain supported
           <Icons.External size={11} />
         </a>
 
@@ -716,4 +847,3 @@ export function ErrorToast({ message, onClose }: { message: string; onClose: () 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main orchestrator
 // ─────────────────────────────────────────────────────────────────────────────
-
