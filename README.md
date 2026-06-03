@@ -469,7 +469,13 @@ A few small values you might want to tune:
   never logged. The server uses it once per request to proxy the call to
   OpenRouter, then discards it.
 - The server-side `OPENROUTER_API_KEY` env var is **optional** and acts only
-  as a fallback for requests that don't include a client-provided key.
+  as a fallback for requests that don't include a client-provided key. When
+  it's set, requests that fall through to it are restricted to the
+  deployment's own origin by default so the hosted demo can't be used as a
+  free OpenRouter proxy from third-party sites or scripts. Operators who
+  front the UI on a different domain than the API can widen the allowlist
+  via `ALLOWED_FALLBACK_ORIGINS` (comma-separated hosts). Requests that
+  supply their own `apiKey` are never gated.
 - No analytics, no telemetry, no tracking.
 
 ## Acknowledgments
