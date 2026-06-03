@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { enforceServerKeyGate } from '@/app/lib/serverKeyGate'
 
 const DEFAULT_MODEL = 'google/gemini-2.0-flash-001'
 
@@ -33,16 +34,22 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const openRouterKey =
-      typeof apiKey === 'string' && apiKey.trim()
-        ? apiKey.trim()
-        : process.env.OPENROUTER_API_KEY
+    const clientKey =
+      typeof apiKey === 'string' && apiKey.trim() ? apiKey.trim() : null
+    const openRouterKey = clientKey ?? process.env.OPENROUTER_API_KEY
 
     if (!openRouterKey) {
       return NextResponse.json(
         { error: 'OpenRouter API key missing. Add one in Settings.' },
         { status: 401 }
       )
+    }
+
+    // BYOK requests are unrestricted; env-fallback requests are gated to the
+    // deployment's own origin (plus operator allowlist). CWE-441.
+    if (!clientKey) {
+      const blocked = enforceServerKeyGate(request)
+      if (blocked) return blocked
     }
 
     const modelId =
