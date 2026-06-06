@@ -198,39 +198,56 @@ export default function Home() {
   // Required-mode means the user can't dismiss the modal (first run, no key
   // anywhere). Optional-mode is used when editing an existing key from settings.
   const [apiKeyRequired, setApiKeyRequired] = useState(false)
+  const [serverHasKey, setServerHasKey] = useState(false)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Hydrate from localStorage on mount, and decide whether to show the modal.
   useEffect(() => {
-    try {
-      const k = localStorage.getItem(STORAGE_KEY) || ''
-      const m = localStorage.getItem(STORAGE_MODEL) || ''
-      const savedMode = localStorage.getItem(STORAGE_MODE) || ''
-      setApiKey(k)
-      if (m && MODELS.some((mm) => mm.value === m)) {
-        setSelectedModel(m)
+    const init = async () => {
+      let hasLocalKey = false
+      try {
+        const k = localStorage.getItem(STORAGE_KEY) || ''
+        const m = localStorage.getItem(STORAGE_MODEL) || ''
+        const savedMode = localStorage.getItem(STORAGE_MODE) || ''
+        setApiKey(k)
+        if (k) hasLocalKey = true
+        if (m && MODELS.some((mm) => mm.value === m)) {
+          setSelectedModel(m)
+        }
+        if (
+          savedMode === 'parallax' ||
+          savedMode === 'extender' ||
+          savedMode === 'tile' ||
+          savedMode === 'sprite' ||
+          savedMode === 'props'
+        ) {
+          setModeState(savedMode)
+        }
+      } catch (err) {
+        console.warn('localStorage hydration error:', err)
       }
-      if (
-        savedMode === 'parallax' ||
-        savedMode === 'extender' ||
-        savedMode === 'tile' ||
-        savedMode === 'sprite' ||
-        savedMode === 'props'
-      ) {
-        setModeState(savedMode)
+
+      // Check if server has fallback key
+      let hasServerKey = false
+      try {
+        const res = await fetch('/api/config')
+        if (res.ok) {
+          const data = await res.json()
+          hasServerKey = !!data.hasKey
+          setServerHasKey(hasServerKey)
+        }
+      } catch (err) {
+        console.warn('Server config fetch failed:', err)
       }
-      if (!k) {
-        setApiKeyRequired(true)
-        setShowApiKeyModal(true)
-      }
-    } catch {
-      // localStorage unavailable (private mode, etc.) — show modal anyway.
-      setApiKeyRequired(true)
-      setShowApiKeyModal(true)
-    } finally {
+
+      const needsKey = !hasLocalKey && !hasServerKey
+      setApiKeyRequired(needsKey)
+      setShowApiKeyModal(needsKey)
       setHydrated(true)
     }
+
+    void init()
   }, [])
 
   /** Persist mode + reset parallax-specific transient state on change. */
@@ -265,6 +282,7 @@ export default function Home() {
 
   const handleSkipApiKey = () => {
     // User has env-set key on server; let them proceed without a client key.
+    setApiKey('')
     setShowApiKeyModal(false)
     setApiKeyRequired(false)
   }
@@ -4018,7 +4036,7 @@ export default function Home() {
         initialValue={apiKey}
         required={apiKeyRequired}
         onSave={handleSaveApiKey}
-        onSkip={apiKeyRequired ? handleSkipApiKey : undefined}
+        onSkip={serverHasKey ? handleSkipApiKey : undefined}
         onClose={() => setShowApiKeyModal(false)}
       />
 
